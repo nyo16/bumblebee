@@ -35,7 +35,15 @@ defmodule Bumblebee.Text.TextEmbedding do
     tokenizer =
       Bumblebee.configure(tokenizer, length: sequence_length, return_token_type_ids: false)
 
-    {_init_fun, encoder} = Axon.build(model)
+    # Enable output_hidden_states if we need hidden_states for embeddings
+    global_layer_options = 
+      if output_attribute == :hidden_states do
+        [output_hidden_states: true]
+      else
+        []
+      end
+
+    {_init_fun, encoder} = Axon.build(model, global_layer_options: global_layer_options)
 
     embedding_fun = fn params, inputs ->
       output = encoder.(params, inputs)
@@ -43,7 +51,13 @@ defmodule Bumblebee.Text.TextEmbedding do
       output =
         case output do
           %{^output_attribute => output} ->
-            output
+            # When output_hidden_states is true, hidden_states is a list of tensors
+            # We want the final layer's output for embeddings
+            if output_attribute == :hidden_states and is_list(output) do
+              List.last(output)
+            else
+              output
+            end
 
           %{} ->
             keys = output |> Map.keys() |> Enum.sort()
@@ -153,30 +167,18 @@ defmodule Bumblebee.Text.TextEmbedding do
   end
 
   defp last_token_pool(hidden_states, attention_mask) do
-    # Check if left padding is used by seeing if all sequences end with a valid token
-    last_column = Nx.slice_along_axis(attention_mask, -1, 1, axis: 1) |> Nx.squeeze(axes: [1])
-    batch_size = Nx.axis_size(attention_mask, 0)
-    left_padding = Nx.sum(last_column) |> Nx.equal(batch_size)
-
-    if Nx.to_number(left_padding) == 1 do
-      # Left padding: take the last token (index -1)
-      Nx.slice_along_axis(hidden_states, -1, 1, axis: 1)
-      |> Nx.squeeze(axes: [1])
-    else
-      # Right padding: find the last non-padded token for each sequence
-      sequence_lengths = 
-        attention_mask
-        |> Nx.sum(axes: [1])
-        |> Nx.subtract(1)  # Convert from length to 0-based index
-
-      # Use gather to get the last token for each sequence  
-      hidden_states
-      |> Nx.to_batched(1)
-      |> Enum.zip(Nx.to_list(sequence_lengths))
-      |> Enum.map(fn {batch_hidden, seq_len} ->
-        Nx.slice_along_axis(batch_hidden, seq_len, 1, axis: 1) |> Nx.squeeze(axes: [0, 1])
-      end)
-      |> Nx.stack()
-    end
+    # Find the last non-padded token for each sequence
+    # Sum attention mask to get sequence lengths, then subtract 1 for 0-based indexing
+    sequence_lengths = Nx.sum(attention_mask, axes: [1]) |> Nx.subtract(1)
+    
+    # Expand indices to match hidden_states shape for take_along_axis
+    batch_size = Nx.axis_size(hidden_states, 0)
+    hidden_size = Nx.axis_size(hidden_states, 2)
+    
+    # Reshape and broadcast indices to match the shape {batch_size, 1, hidden_size}
+    indices = Nx.reshape(sequence_lengths, {batch_size, 1, 1})
+    indices = Nx.broadcast(indices, {batch_size, 1, hidden_size})
+    
+    Nx.take_along_axis(hidden_states, indices, axis: 1) |> Nx.squeeze(axes: [1])
   end
 end

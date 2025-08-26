@@ -81,7 +81,7 @@ defmodule Bumblebee.Text.Qwen3 do
         doc: "whether to tie input and output embedding weights"
       ]
     ] ++
-      Shared.common_options([:num_labels, :id_to_label]) ++ Shared.token_options(pad_token_id: 151643)
+      Shared.common_options([:output_hidden_states, :output_attentions, :num_labels, :id_to_label]) ++ Shared.token_options(pad_token_id: 151643)
 
   @moduledoc """
   Qwen3 model family.
@@ -188,10 +188,29 @@ defmodule Bumblebee.Text.Qwen3 do
   @impl true
   def model(%__MODULE__{architecture: :base} = spec) do
     inputs = inputs(spec)
+    outputs = core(inputs, spec)
 
-    inputs
-    |> core(spec)
-    |> Layers.output()
+    # For base architecture, only return the final hidden state and optionally hidden_states
+    base_output = %{
+      hidden_state: outputs.hidden_state,
+      cache: outputs.cache
+    }
+    
+    base_output = 
+      if spec.output_attentions do
+        Map.put(base_output, :attentions, outputs.attentions)
+      else
+        base_output
+      end
+    
+    base_output = 
+      if spec.output_hidden_states do
+        Map.put(base_output, :hidden_states, outputs.hidden_states)
+      else
+        base_output
+      end
+
+    Layers.output(base_output)
   end
 
   def model(%__MODULE__{architecture: :for_causal_language_modeling} = spec) do
@@ -283,7 +302,7 @@ defmodule Bumblebee.Text.Qwen3 do
 
     %{
       hidden_state: pooled_state,
-      hidden_states: decoder_outputs.hidden_states,
+      hidden_states: Layers.append(decoder_outputs.hidden_states, pooled_state),
       attentions: decoder_outputs.attentions,
       cache: decoder_outputs.cache
     }
@@ -375,6 +394,7 @@ defmodule Bumblebee.Text.Qwen3 do
           num_blocks: {"num_hidden_layers", number()},
           num_attention_heads: {"num_attention_heads", number()},
           num_key_value_heads: {"num_key_value_heads", number()},
+          attention_head_size: {"head_dim", number()},
           intermediate_size: {"intermediate_size", number()},
           layer_norm_epsilon: {"rms_norm_eps", number()},
           rotary_embedding_base: {"rope_theta", number()},
