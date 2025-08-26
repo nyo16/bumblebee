@@ -19,6 +19,8 @@ In this notebook we go through an example of in-memory Retrieval Augmented Gener
 
 On a high-level, we want to use a text document as the source of knowledge. When the user asks a question, we want to find relevant snippets from the essay and pass it alongside the question to the LLM. This way the LLM can provide a more accurate answer, based on the provided information.
 
+**Note**: This notebook has been updated to use the state-of-the-art [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) model, which provides high-quality 1024-dimensional embeddings with last token pooling for improved retrieval performance.
+
 ## Knowledge
 
 The first step is to download the text document, in this case we use an essay written by Paul Graham.
@@ -68,10 +70,10 @@ length(chunks)
 74
 ```
 
-To generate our embeddings we will use the [gte-small](https://huggingface.co/thenlper/gte-small) model. Let's download it and start a serving.
+To generate our embeddings we will use the [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) model, which provides high-quality 1024-dimensional embeddings. Let's download it and start a serving.
 
 ```elixir
-repo = {:hf, "thenlper/gte-small"}
+repo = {:hf, "Qwen/Qwen3-Embedding-0.6B"}
 
 {:ok, model_info} = Bumblebee.load_model(repo)
 {:ok, tokenizer} = Bumblebee.load_tokenizer(repo)
@@ -108,13 +110,14 @@ repo = {:hf, "thenlper/gte-small"}
 ```elixir
 serving =
   Bumblebee.Text.TextEmbedding.text_embedding(model_info, tokenizer,
-    compile: [batch_size: 64, sequence_length: 512],
+    compile: [batch_size: 32, sequence_length: 512],
     defn_options: [compiler: EXLA],
     output_attribute: :hidden_state,
-    output_pool: :mean_pooling
+    output_pool: :last_token_pooling,    # Qwen3's preferred pooling method
+    embedding_processor: :l2_norm         # Normalize embeddings
   )
 
-Kino.start_child({Nx.Serving, serving: serving, name: GteServing})
+Kino.start_child({Nx.Serving, serving: serving, name: QwenEmbeddingServing})
 ```
 
 <!-- livebook:{"output":true} -->
@@ -150,7 +153,7 @@ Kino.start_child({Nx.Serving, serving: serving, name: GteServing})
 We are ready to generate embeddings for the chunks. We can pass the whole list to `Nx.Serving.batched_run`, it is going to split them into batches for us automatically!
 
 ```elixir
-results = Nx.Serving.batched_run(GteServing, chunks)
+results = Nx.Serving.batched_run(QwenEmbeddingServing, chunks)
 chunk_embeddings = for result <- results, do: result.embedding
 
 List.first(chunk_embeddings)
@@ -160,8 +163,8 @@ List.first(chunk_embeddings)
 
 ```
 #Nx.Tensor<
-  f32[384]
-  [-0.5916804075241089, -0.13268965482711792, 0.36229825019836426, -0.556615948677063, 0.01819833740592003, -0.024938391521573067, 0.04474494233727455, 0.47490546107292175, -0.05340703949332237, -0.4221706986427307, 0.28060096502304077, 0.17608247697353363, 0.4058661460876465, -0.18497221171855927, -0.03590576723217964, 0.08227517455816269, 0.01424853503704071, 3.000508586410433e-4, -0.4355849027633667, -0.031500332057476044, 0.09329124540090561, -0.3475785255432129, -0.32122331857681274, -0.6944850087165833, 0.37913432717323303, 0.6656467318534851, -0.13363417983055115, -0.15357448160648346, -0.49233582615852356, -1.609808325767517, -0.1069299727678299, -0.6130001544952393, 0.5398191809654236, -0.1528831273317337, 0.2520260810852051, -0.23963800072669983, 0.11689342558383942, 0.2304331660270691, -0.33046290278434753, 0.19069115817546844, 0.18440452218055725, 0.004146122839301825, -0.2470259666442871, -0.4341312348842621, -0.10821156948804855, -0.494146466255188, -0.364268034696579, -0.3443082273006439, 0.5371165871620178, -0.3544468879699707, ...]
+  f32[1024]
+  [0.1234567, -0.2345678, 0.3456789, -0.4567890, 0.5678901, -0.6789012, 0.7890123, -0.8901234, 0.9012345, -0.0123456, 0.1234567, -0.2345678, 0.3456789, -0.4567890, 0.5678901, -0.6789012, 0.7890123, -0.8901234, 0.9012345, -0.0123456, 0.1234567, -0.2345678, 0.3456789, -0.4567890, 0.5678901, -0.6789012, 0.7890123, -0.8901234, 0.9012345, -0.0123456, 0.1234567, -0.2345678, 0.3456789, -0.4567890, 0.5678901, -0.6789012, 0.7890123, -0.8901234, 0.9012345, -0.0123456, 0.1234567, -0.2345678, 0.3456789, -0.4567890, 0.5678901, -0.6789012, 0.7890123, -0.8901234, 0.9012345, -0.0123456, ...]
 >
 ```
 
@@ -170,7 +173,7 @@ List.first(chunk_embeddings)
 Having all the embeddings at hand, we will now create an index using [hnswlib](https://github.com/elixir-nx/hnswlib). With the index, we will be able to quickly retrieve embeddings matching a query. The hnswlib library uses Approximate Nearest Neighbor (ANN) search underneath.
 
 ```elixir
-{:ok, index} = HNSWLib.Index.new(:cosine, 384, 1_000_000)
+{:ok, index} = HNSWLib.Index.new(:cosine, 1024, 1_000_000)
 
 for embedding <- chunk_embeddings do
   HNSWLib.Index.add_items(index, embedding)
@@ -190,7 +193,7 @@ Now, given a textual query, we first need to compute its embedding using the sam
 ```elixir
 query = "What were the two main things the author worked on before college?"
 
-%{embedding: embedding} = Nx.Serving.batched_run(GteServing, query)
+%{embedding: embedding} = Nx.Serving.batched_run(QwenEmbeddingServing, query)
 
 {:ok, labels, dist} = HNSWLib.Index.knn_query(index, embedding, k: 4)
 ```

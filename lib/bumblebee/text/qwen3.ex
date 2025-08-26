@@ -303,11 +303,11 @@ defmodule Bumblebee.Text.Qwen3 do
       hidden_size: spec.hidden_size,
       kernel_initializer: kernel_initializer(spec),
       layer_norm: &Layers.rms_norm(&1, name: &2, epsilon: spec.layer_norm_epsilon),
-      ffn: [
-        intermediate_size: spec.intermediate_size,
-        activation: spec.activation,
-        gate: true
-      ],
+      ffn:
+        &gated_ffn(&1, spec.intermediate_size, spec.hidden_size,
+          name: &2,
+          activation: spec.activation
+        ),
       block_type: :norm_first,
       causal: true,
       rotary_embedding: [
@@ -324,6 +324,22 @@ defmodule Bumblebee.Text.Qwen3 do
     )
   end
 
+  defp gated_ffn(hidden_state, intermediate_size, output_size, opts) do
+    name = opts[:name]
+    activation = opts[:activation]
+
+    intermediate =
+      Axon.dense(hidden_state, intermediate_size,
+        name: join(name, "intermediate"),
+        use_bias: false
+      )
+
+    gate = Axon.dense(hidden_state, intermediate_size, name: join(name, "gate"), use_bias: false)
+
+    hidden_state = Axon.multiply(intermediate, Axon.activation(gate, activation))
+
+    Axon.dense(hidden_state, output_size, name: join(name, "output"), use_bias: false)
+  end
 
   defp embedder(input_ids, input_embeddings, spec, opts) do
     name = opts[:name]
@@ -375,16 +391,15 @@ defmodule Bumblebee.Text.Qwen3 do
         "qwen3.decoder.{n}.self_attention.output" => "model.layers.{n}.self_attn.o_proj",
         "qwen3.decoder.{n}.self_attention.rotary_embedding" =>
           "model.layers.{n}.self_attn.rotary_emb",
-        "qwen3.decoder.{n}.feed_forward.intermediate" =>
-          "model.layers.{n}.mlp.gate_proj",
-        "qwen3.decoder.{n}.feed_forward.intermediate_up" => "model.layers.{n}.mlp.up_proj",
-        "qwen3.decoder.{n}.feed_forward.output" => "model.layers.{n}.mlp.down_proj",
+        "qwen3.decoder.{n}.ffn.gate" => "model.layers.{n}.mlp.gate_proj",
+        "qwen3.decoder.{n}.ffn.intermediate" => "model.layers.{n}.mlp.up_proj",
+        "qwen3.decoder.{n}.ffn.output" => "model.layers.{n}.mlp.down_proj",
         "qwen3.decoder.{n}.output_norm" => "model.layers.{n}.input_layernorm",
         "qwen3.decoder.{n}.self_attention_norm" =>
           "model.layers.{n}.post_attention_layernorm",
         "qwen3.norm" => "model.norm",
-        "language_modeling_head.output" => "lm_head",
-        "sequence_classification_head.output" => "score"
+        "qwen3.language_modeling_head.output" => "lm_head",
+        "qwen3.sequence_classification_head.output" => "score"
       }
     end
   end
