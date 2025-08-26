@@ -385,6 +385,9 @@ defmodule Bumblebee.Text do
           Note that we currently assume that the CLS token is the first token
           in the sequence
 
+        * `:last_token_pooling` - takes the embedding for the last non-padded token.
+          This handles both left-padded and right-padded sequences correctly
+
       By default no pooling is applied
 
     * `:embedding_processor` - a post-processing step to apply to the

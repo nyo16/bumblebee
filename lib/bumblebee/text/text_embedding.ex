@@ -78,9 +78,12 @@ defmodule Bumblebee.Text.TextEmbedding do
             |> Nx.sum(axes: [1])
             |> Nx.divide(Nx.sum(input_mask_expanded, axes: [1]))
 
+          :last_token_pooling ->
+            last_token_pool(output, inputs["attention_mask"])
+
           other ->
             raise ArgumentError,
-                  "expected :output_pool to be one of :cls_token_pooling, :mean_pooling or nil, got: #{inspect(other)}"
+                  "expected :output_pool to be one of :cls_token_pooling, :mean_pooling, :last_token_pooling or nil, got: #{inspect(other)}"
         end
 
       output =
@@ -147,5 +150,33 @@ defmodule Bumblebee.Text.TextEmbedding do
       end
       |> Shared.normalize_output(multi?)
     end)
+  end
+
+  defp last_token_pool(hidden_states, attention_mask) do
+    # Check if left padding is used by seeing if all sequences end with a valid token
+    last_column = Nx.slice_along_axis(attention_mask, -1, 1, axis: 1) |> Nx.squeeze(axes: [1])
+    batch_size = Nx.axis_size(attention_mask, 0)
+    left_padding = Nx.sum(last_column) |> Nx.equal(batch_size)
+
+    if Nx.to_number(left_padding) == 1 do
+      # Left padding: take the last token (index -1)
+      Nx.slice_along_axis(hidden_states, -1, 1, axis: 1)
+      |> Nx.squeeze(axes: [1])
+    else
+      # Right padding: find the last non-padded token for each sequence
+      sequence_lengths = 
+        attention_mask
+        |> Nx.sum(axes: [1])
+        |> Nx.subtract(1)  # Convert from length to 0-based index
+
+      # Use gather to get the last token for each sequence  
+      hidden_states
+      |> Nx.to_batched(1)
+      |> Enum.zip(Nx.to_list(sequence_lengths))
+      |> Enum.map(fn {batch_hidden, seq_len} ->
+        Nx.slice_along_axis(batch_hidden, seq_len, 1, axis: 1) |> Nx.squeeze(axes: [0, 1])
+      end)
+      |> Nx.stack()
+    end
   end
 end
