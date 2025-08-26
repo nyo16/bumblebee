@@ -191,7 +191,7 @@ defmodule Bumblebee.Text.Qwen3 do
 
     inputs
     |> core(spec)
-    |> Axon.container()
+    |> Layers.output()
   end
 
   def model(%__MODULE__{architecture: :for_causal_language_modeling} = spec) do
@@ -207,9 +207,12 @@ defmodule Bumblebee.Text.Qwen3 do
         name: "language_modeling_head.output"
       )
 
-    outputs
-    |> Map.put(:logits, logits)
-    |> Axon.container()
+    Layers.output(%{
+      logits: logits,
+      hidden_states: outputs.hidden_states,
+      attentions: outputs.attentions,
+      cache: outputs.cache
+    })
   end
 
   def model(%__MODULE__{architecture: :for_sequence_classification} = spec) do
@@ -225,9 +228,11 @@ defmodule Bumblebee.Text.Qwen3 do
         name: "sequence_classification_head.output"
       )
 
-    outputs
-    |> Map.put(:logits, logits)
-    |> Axon.container()
+    Layers.output(%{
+      logits: logits,
+      hidden_states: outputs.hidden_states,
+      attentions: outputs.attentions
+    })
   end
 
   defp inputs(spec) do
