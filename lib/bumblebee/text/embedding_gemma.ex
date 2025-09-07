@@ -350,6 +350,15 @@ defmodule Bumblebee.Text.EmbeddingGemma do
     def load(spec, data) do
       import Shared.Converters
 
+      # EmbeddingGemma-specific activation converter
+      embedding_gemma_activation = fn name, value ->
+        case value do
+          "gelu_new" -> {:ok, :gelu}
+          "gelu_pytorch_tanh" -> {:ok, :gelu}
+          other -> activation().(name, other)
+        end
+      end
+
       scaling_strategy_converter = fn name, value ->
         case value do
           %{"type" => "linear", "factor" => factor} when is_number(factor) ->
@@ -373,7 +382,7 @@ defmodule Bumblebee.Text.EmbeddingGemma do
           num_key_value_heads: {"num_key_value_heads", number()},
           attention_head_size: {"head_dim", number()},
           intermediate_size: {"intermediate_size", number()},
-          activation: {"hidden_act", activation()},
+          activation: {"hidden_act", embedding_gemma_activation},
           use_attention_bias: {"attention_bias", boolean()},
           rotary_embedding_base: {"rope_theta", number()},
           rotary_embedding_scaling_strategy:

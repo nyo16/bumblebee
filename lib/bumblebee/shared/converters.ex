@@ -206,8 +206,8 @@ defmodule Bumblebee.Shared.Converters do
 
   def activation() do
     mapping = %{
-      "gelu_new" => :gelu,
-      "gelu_pytorch_tanh" => :gelu,
+      "gelu_new" => :gelu_approx_tanh,
+      "gelu_pytorch_tanh" => :gelu_approx_tanh,
       "quick_gelu" => :gelu_approx_sigmoid
     }
 
