@@ -1,0 +1,434 @@
+# EmbeddingGemma Text Embeddings with Bumblebee
+
+```elixir
+Mix.install([
+  {:bumblebee, "~> 0.6.0"},
+  {:exla, "~> 0.10.0"},
+  {:nx, "~> 0.10.0"},
+  {:kino, "~> 0.12.0"}
+])
+```
+
+## Introduction
+
+EmbeddingGemma is a 300M parameter embedding model from Google DeepMind, built on the Gemma 3 architecture. Unlike regular Gemma models that use causal attention for text generation, EmbeddingGemma uses **bidirectional attention** to create high-quality text embeddings.
+
+This notebook demonstrates how to use EmbeddingGemma with Bumblebee for:
+- Text embeddings generation
+- Semantic similarity computation  
+- Document ranking and retrieval
+- Multilingual text understanding
+
+## Setup and Configuration
+
+First, let's configure EXLA for optimal performance with EmbeddingGemma:
+
+```elixir
+# Configure EXLA for fast inference
+Application.put_env(:nx, :default_defn_options, compiler: EXLA, client: :host)
+
+# Set your HuggingFace token (required for EmbeddingGemma)
+auth_token = System.get_env("HF_TOKEN") || "your_token_here"
+
+if auth_token == "your_token_here" do
+  IO.puts("⚠️  Please set your HuggingFace token in the HF_TOKEN environment variable")
+end
+```
+
+## Model Loading
+
+EmbeddingGemma requires authentication to download. We'll load both the model and tokenizer:
+
+```elixir
+# Load EmbeddingGemma model with float32 precision for best accuracy
+IO.puts("🔄 Loading EmbeddingGemma model...")
+
+{:ok, model_info} = 
+  Bumblebee.load_model(
+    {:hf, "google/embeddinggemma-300m", auth_token: auth_token}, 
+    architecture: :for_text_embedding,  # Built-in mean pooling
+    type: "f32",  # Use float32 for best precision (as recommended by Google)
+    backend: {EXLA.Backend, client: :host}
+  )
+
+IO.puts("✅ Model loaded successfully!")
+IO.inspect(model_info.spec, label: "Model Specification")
+```
+
+```elixir
+# Load tokenizer
+IO.puts("🔄 Loading tokenizer...")
+
+{:ok, tokenizer} = 
+  Bumblebee.load_tokenizer(
+    {:hf, "google/embeddinggemma-300m", auth_token: auth_token},
+    type: :gemma
+  )
+
+IO.puts("✅ Tokenizer loaded successfully!")
+IO.inspect(tokenizer.special_tokens, label: "Special Tokens")
+```
+
+## Create Text Embedding Serving
+
+Now let's create a serving pipeline for generating embeddings:
+
+```elixir
+# Create text embedding serving with L2 normalization
+serving = 
+  Bumblebee.Text.text_embedding(model_info, tokenizer, 
+    output_attribute: :pooled_state,    # Use built-in mean pooling
+    embedding_processor: :l2_norm       # L2 normalize for cosine similarity
+  )
+
+IO.puts("🚀 Embedding serving ready!")
+```
+
+## Basic Usage Examples
+
+### Single Text Embedding
+
+```elixir
+# Generate embedding for a single text
+text = "Machine learning is transforming the world of artificial intelligence."
+
+%{embedding: embedding} = Nx.Serving.run(serving, text)
+
+IO.puts("📊 Embedding Properties:")
+IO.puts("Shape: #{inspect(Nx.shape(embedding))}")
+IO.puts("Type: #{inspect(Nx.type(embedding))}")
+IO.puts("L2 Norm: #{Nx.to_number(Nx.LinAlg.norm(embedding)) |> Float.round(6)}")
+
+# Show first 10 dimensions
+first_10 = Nx.to_list(embedding) |> Enum.take(10)
+IO.puts("\nFirst 10 dimensions:")
+Enum.each(Enum.with_index(first_10), fn {val, idx} ->
+  IO.puts("  [#{idx}]: #{Float.round(val, 6)}")
+end)
+```
+
+### Batch Processing
+
+```elixir
+# Process multiple texts at once
+texts = [
+  "The quick brown fox jumps over the lazy dog.",
+  "Artificial intelligence is revolutionizing healthcare.",
+  "Climate change poses significant challenges to our planet.",
+  "Quantum computing promises to solve complex problems."
+]
+
+results = Nx.Serving.run(serving, texts)
+
+IO.puts("📦 Batch Processing Results:")
+IO.puts("Number of texts: #{length(texts)}")
+IO.puts("Number of embeddings: #{length(results)}")
+
+# Verify all embeddings are normalized
+Enum.with_index(results) 
+|> Enum.each(fn {%{embedding: emb}, idx} ->
+  norm = Nx.to_number(Nx.LinAlg.norm(emb))
+  IO.puts("Text #{idx + 1} L2 norm: #{Float.round(norm, 6)}")
+end)
+```
+
+## Semantic Similarity
+
+Let's explore semantic similarity between different texts:
+
+```elixir
+# Test semantic similarity
+similar_texts = [
+  "The cat sits on the mat.",
+  "A feline rests on a rug.",
+  "Dogs are loyal companions.",
+  "Machine learning algorithms process data."
+]
+
+# Generate embeddings
+embeddings = 
+  similar_texts
+  |> Enum.map(fn text -> Nx.Serving.run(serving, text).embedding end)
+
+# Compute pairwise similarities using dot product (cosine similarity for L2-normalized vectors)
+similarities = 
+  for {emb1, i} <- Enum.with_index(embeddings),
+      {emb2, j} <- Enum.with_index(embeddings),
+      i <= j do
+    sim = Nx.to_number(Nx.dot(emb1, emb2))
+    {i, j, sim, similar_texts |> Enum.at(i), similar_texts |> Enum.at(j)}
+  end
+
+IO.puts("🔍 Semantic Similarity Matrix:")
+IO.puts("Format: [Text1 Index, Text2 Index, Similarity, Text1, Text2]\n")
+
+similarities
+|> Enum.sort_by(fn {_, _, sim, _, _} -> sim end, :desc)
+|> Enum.each(fn {i, j, sim, text1, text2} ->
+  IO.puts("#{i}-#{j}: #{Float.round(sim, 4)}")
+  IO.puts("  \"#{text1}\"")
+  if i != j, do: IO.puts("  \"#{text2}\"")
+  IO.puts("")
+end)
+```
+
+## Document Ranking Example
+
+Let's replicate the exact example from Google's documentation:
+
+```elixir
+# Exact test case from Google's EmbeddingGemma documentation
+query = "Which planet is known as the Red Planet?"
+
+documents = [
+  "Venus is often called Earth's twin because of its similar size and proximity.",
+  "Mars, known for its reddish appearance, is often referred to as the Red Planet.",  
+  "Jupiter, the largest planet in our solar system, has a prominent red spot.",
+  "Saturn, famous for its rings, is sometimes mistaken for the Red Planet."
+]
+
+IO.puts("🔍 Query: \"#{query}\"")
+IO.puts("\n📚 Documents to rank:")
+Enum.with_index(documents) 
+|> Enum.each(fn {doc, idx} ->
+  IO.puts("  #{idx + 1}. #{doc}")
+end)
+```
+
+```elixir
+# Generate embeddings
+query_embedding = Nx.Serving.run(serving, query).embedding
+document_results = Nx.Serving.run(serving, documents)
+document_embeddings = 
+  document_results
+  |> Enum.map(fn %{embedding: emb} -> emb end)
+  |> Nx.stack()
+
+# Check shapes
+IO.puts("📊 Shape Analysis:")
+IO.puts("Query embedding: #{inspect(Nx.shape(query_embedding))}")  
+IO.puts("Document embeddings: #{inspect(Nx.shape(document_embeddings))}")
+
+# Compute similarities
+similarities = Nx.dot(query_embedding, [0], document_embeddings, [1])
+similarity_scores = Nx.to_list(similarities)
+
+IO.puts("\n🎯 Similarity Scores:")
+IO.inspect(similarity_scores |> Enum.map(&Float.round(&1, 4)))
+
+# Expected results from Google's documentation: [0.3011, 0.6359, 0.4930, 0.4889]
+expected = [0.3011, 0.6359, 0.4930, 0.4889]
+IO.puts("\n📈 Comparison with Expected Results:")
+Enum.zip([expected, similarity_scores])
+|> Enum.with_index()
+|> Enum.each(fn {{exp, act}, idx} ->
+  diff = abs(exp - act)
+  status = if diff < 0.1, do: "✅", else: "⚠️"
+  IO.puts("Doc #{idx + 1}: Expected=#{exp}, Actual=#{Float.round(act, 4)}, Diff=#{Float.round(diff, 4)} #{status}")
+end)
+```
+
+```elixir
+# Rank documents by similarity
+ranked_results = 
+  documents
+  |> Enum.zip(similarity_scores)
+  |> Enum.with_index()
+  |> Enum.sort_by(fn {{_doc, score}, _idx} -> score end, :desc)
+
+IO.puts("🏆 Document Ranking (Best to Worst):")
+ranked_results
+|> Enum.with_index()
+|> Enum.each(fn {{{doc, score}, original_idx}, rank} ->
+  IO.puts("\n#{rank + 1}. Document #{original_idx + 1} (Score: #{Float.round(score, 4)})")
+  IO.puts("   \"#{doc}\"")
+end)
+
+# The correct answer should be Document 2 about Mars
+{{{best_doc, best_score}, best_idx}, _} = Enum.at(ranked_results, 0)
+IO.puts("\n🎯 Best Match:")
+IO.puts("Document #{best_idx + 1} with score #{Float.round(best_score, 4)}")
+IO.puts("\"#{best_doc}\"")
+```
+
+## Multilingual Capabilities
+
+EmbeddingGemma supports 100+ languages. Let's test cross-lingual similarity:
+
+```elixir
+# Multilingual similarity test
+multilingual_texts = [
+  "The cat sits on the mat.",           # English
+  "Le chat est assis sur le tapis.",    # French  
+  "Die Katze sitzt auf der Matte.",     # German
+  "El gato se sienta en la alfombra.",  # Spanish
+  "Il gatto si siede sul tappeto.",     # Italian
+  "Dogs are great pets."                # English (different topic)
+]
+
+# Generate embeddings
+multilingual_embeddings = 
+  multilingual_texts
+  |> Enum.map(fn text -> Nx.Serving.run(serving, text).embedding end)
+
+# Compare similarities  
+reference_embedding = Enum.at(multilingual_embeddings, 0)  # English "cat" sentence
+
+IO.puts("🌍 Multilingual Semantic Similarity:")
+IO.puts("Reference: \"#{Enum.at(multilingual_texts, 0)}\"")
+IO.puts("")
+
+multilingual_texts
+|> Enum.drop(1)  # Skip the reference text
+|> Enum.zip(Enum.drop(multilingual_embeddings, 1))
+|> Enum.with_index(1)
+|> Enum.each(fn {{text, embedding}, idx} ->
+  similarity = Nx.to_number(Nx.dot(reference_embedding, embedding))
+  flag = case idx do
+    1 -> "🇫🇷"  # French
+    2 -> "🇩🇪"  # German  
+    3 -> "🇪🇸"  # Spanish
+    4 -> "🇮🇹"  # Italian
+    5 -> "🐕"   # Different topic
+  end
+  
+  IO.puts("#{flag} Similarity: #{Float.round(similarity, 4)}")
+  IO.puts("   \"#{text}\"")
+  IO.puts("")
+end)
+```
+
+## Performance Benchmarking
+
+Let's benchmark the embedding generation performance:
+
+```elixir
+# Benchmark embedding generation
+benchmark_texts = [
+  "Short text.",
+  "This is a medium length sentence that contains more words and complexity.",
+  "This is a much longer paragraph that contains significantly more text content. It includes multiple sentences with various topics and concepts. The purpose is to test how the embedding model handles longer input sequences and whether there are performance differences based on text length. EmbeddingGemma should be able to process this efficiently while maintaining high-quality representations."
+]
+
+IO.puts("⏱️  Performance Benchmark:")
+
+benchmark_texts
+|> Enum.with_index()
+|> Enum.each(fn {text, idx} ->
+  # Warm up
+  Nx.Serving.run(serving, text)
+  
+  # Benchmark
+  {time_micro, _result} = :timer.tc(fn -> 
+    Nx.Serving.run(serving, text)
+  end)
+  
+  time_ms = time_micro / 1000
+  char_count = String.length(text)
+  
+  IO.puts("\nText #{idx + 1} (#{char_count} characters):")
+  IO.puts("  Time: #{Float.round(time_ms, 2)} ms")
+  IO.puts("  Speed: #{Float.round(char_count / time_ms * 1000, 0)} chars/second")
+  IO.puts("  Preview: \"#{String.slice(text, 0, 50)}#{if char_count > 50, do: "...", else: ""}\"")
+end)
+```
+
+## Use Cases and Applications
+
+```elixir
+IO.puts("""
+🎯 EmbeddingGemma Use Cases:
+
+1. **Semantic Search**
+   - Find relevant documents based on meaning, not just keywords
+   - Cross-lingual information retrieval
+   - FAQ matching and question answering
+
+2. **Text Classification**
+   - Categorize documents, emails, or social media posts
+   - Sentiment analysis and content moderation
+   - Topic modeling and clustering
+
+3. **Recommendation Systems**  
+   - Content-based recommendations
+   - Similar article/product suggestions
+   - Personalized content discovery
+
+4. **Data Deduplication**
+   - Identify duplicate or near-duplicate content
+   - Merge similar customer feedback
+   - Clean up datasets with redundant entries
+
+5. **Retrieval Augmented Generation (RAG)**
+   - Enhance LLM responses with relevant context
+   - Build knowledge bases and chatbots
+   - Fact-checking and source attribution
+
+6. **Multilingual Applications**
+   - Cross-language document matching
+   - Translation quality assessment
+   - Multilingual customer support routing
+
+Key Advantages:
+✅ 768-dimensional embeddings (compact yet expressive)
+✅ Bidirectional attention (better than decoder-only models for embeddings)
+✅ 100+ language support
+✅ On-device deployment ready (300M parameters)
+✅ Compatible with existing sentence-transformers ecosystem
+""")
+```
+
+## Next Steps
+
+```elixir
+IO.puts("""
+🚀 Next Steps for Production Usage:
+
+1. **Model Serving**
+   ```elixir
+   # Compile for production with fixed batch size
+   serving = Bumblebee.Text.text_embedding(model_info, tokenizer,
+     output_attribute: :pooled_state,
+     embedding_processor: :l2_norm,
+     compile: [batch_size: 32, sequence_length: 512],
+     defn_options: [compiler: EXLA]
+   )
+   ```
+
+2. **Vector Database Integration**
+   - Store embeddings in Pinecone, Weaviate, or Qdrant
+   - Use for similarity search and retrieval
+   - Build semantic search applications
+
+3. **Fine-tuning**
+   - Adapt to domain-specific vocabulary
+   - Improve performance on specialized tasks
+   - Use Sentence Transformers training techniques
+
+4. **Optimization**
+   - Use quantization for smaller memory footprint
+   - Batch processing for higher throughput
+   - GPU acceleration for large-scale inference
+
+5. **Integration**
+   - Add to Phoenix LiveView applications
+   - Use with Nx.Serving for concurrent requests
+   - Deploy with Bandit for production serving
+""")
+```
+
+---
+
+**Model Information:**
+- **Model**: google/embeddinggemma-300m  
+- **Parameters**: 300M
+- **Architecture**: Gemma 3 with bidirectional attention
+- **Output Dimensions**: 768
+- **Context Length**: 2048 tokens
+- **Languages**: 100+
+- **License**: Gemma Terms of Use
+
+**Links:**
+- [Model Card](https://huggingface.co/google/embeddinggemma-300m)
+- [Google's Blog Post](https://developers.googleblog.com/en/introducing-embeddinggemma/)
+- [Bumblebee Documentation](https://hexdocs.pm/bumblebee/)
