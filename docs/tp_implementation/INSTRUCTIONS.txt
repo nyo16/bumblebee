@@ -1,0 +1,70 @@
+================================================================================
+TENSOR PARALLELISM IMPLEMENTATION - CONTINUATION INSTRUCTIONS
+================================================================================
+
+To Continue on New Machine:
+
+1. Clone this branch:
+   git clone -b tensor-parallelism-plan https://github.com/nyo16/bumblebee.git
+   cd bumblebee
+
+2. Tell Claude Code:
+   "Read TENSOR_PARALLELISM_PLAN.md and the files in docs/tp_implementation/
+   to understand the tensor parallelism implementation plan.
+   Then continue implementing from Phase 1."
+
+3. First steps - Clone Nx with sharding POC:
+   git clone https://github.com/elixir-nx/nx.git
+   cd nx
+   git fetch origin pull/1646/head:pv-feat/exla-sharding-poc
+   git checkout pv-feat/exla-sharding-poc
+
+4. Build EXLA:
+   cd exla
+   mix deps.get
+   mix compile
+
+5. Test existing sharding (optional):
+   XLA_FLAGS="--xla_force_host_platform_device_count=2" mix run sharding.exs
+
+================================================================================
+FILES IN THIS DIRECTORY
+================================================================================
+
+TENSOR_PARALLELISM_PLAN.md   - Complete research and implementation guide
+exla_collective.ex           - EXLA collective operations (all-reduce, all-gather)
+bumblebee_distributed.ex     - Main Bumblebee.Distributed API
+sharded_loader.ex            - Sharded parameter loading with TP rules
+tp_layers.ex                 - Column/row parallel dense layers
+tp_transformer.ex            - Full TP transformer blocks for Mistral/Llama
+
+================================================================================
+IMPLEMENTATION PHASES
+================================================================================
+
+Phase 1: EXLA Collective Operations
+  - Add all-reduce, all-gather to EXLA (building on PR #1646)
+  - Files: exla/lib/exla/collective.ex, exla/c_src/exla/exla.cc
+
+Phase 2: Sharded Parameter Loading
+  - Load Mistral weights sharded across GPUs
+  - Files: lib/bumblebee/distributed.ex, lib/bumblebee/distributed/sharded_loader.ex
+
+Phase 3: TP-Aware Transformer Layers
+  - Implement column-parallel and row-parallel dense with all-reduce
+  - Files: lib/bumblebee/distributed/tp_layers.ex, tp_transformer.ex
+
+Phase 4: Distributed Serving
+  - End-to-end inference with TP
+  - Files: lib/bumblebee/text/generation.ex, lib/bumblebee/layers/decoder.ex
+
+================================================================================
+TARGET CONFIGURATION
+================================================================================
+
+- Model: Mistral 7B
+- TP Size: 2 (2 GPUs)
+- Strategy: vLLM-style tensor parallelism
+- Base: Paulo Valente's PR #1646 (pv-feat/exla-sharding-poc)
+
+================================================================================
