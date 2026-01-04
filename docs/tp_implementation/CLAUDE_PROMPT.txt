@@ -1,0 +1,1 @@
+Read TENSOR_PARALLELISM_PLAN.md and the files in docs/tp_implementation/ to understand the tensor parallelism implementation plan. Then continue implementing from Phase 1.

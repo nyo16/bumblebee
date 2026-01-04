@@ -31,12 +31,14 @@ To Continue on New Machine:
 FILES IN THIS DIRECTORY
 ================================================================================
 
+CLAUDE_PROMPT.txt            - Copy-paste prompt for Claude Code continuation
 TENSOR_PARALLELISM_PLAN.md   - Complete research and implementation guide
 exla_collective.ex           - EXLA collective operations (all-reduce, all-gather)
 bumblebee_distributed.ex     - Main Bumblebee.Distributed API
 sharded_loader.ex            - Sharded parameter loading with TP rules
 tp_layers.ex                 - Column/row parallel dense layers
 tp_transformer.ex            - Full TP transformer blocks for Mistral/Llama
+exo_research.md              - Research from exo-explore/exo repository
 
 ================================================================================
 IMPLEMENTATION PHASES
