@@ -34,9 +34,13 @@ defmodule Bumblebee.MixProject do
       {:axon, "~> 0.7.0"},
       # {:axon, github: "elixir-nx/axon", override: true},
       {:tokenizers, "~> 0.4"},
-      {:nx, "~> 0.9.0 or ~> 0.10.0"},
-      {:exla, ">= 0.0.0", only: [:dev, :test]},
+      # Using local Nx repository for tensor parallelism development
+      {:nx, path: "../nx/nx", override: true},
+      {:exla, path: "../nx/exla", only: [:dev, :test], override: true},
       {:torchx, ">= 0.0.0", only: [:dev, :test]},
+      # Original deps (commented out for TP development):
+      # {:nx, "~> 0.9.0 or ~> 0.10.0"},
+      # {:exla, ">= 0.0.0", only: [:dev, :test]},
       # {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
       # {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, only: [:dev, :test]},
       # {:torchx, github: "elixir-nx/nx", sparse: "torchx", override: true, only: [:dev, :test]},
