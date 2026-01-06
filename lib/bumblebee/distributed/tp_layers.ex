@@ -179,17 +179,10 @@ defmodule Bumblebee.Distributed.TPLayers do
     )
   end
 
-  # The actual all-reduce implementation
-  # This will be called during JIT compilation with EXLA
-  defnp all_reduce_impl(tensor, _opts, _op, _replica_groups) do
-    # Note: This is a placeholder that passes through the tensor
-    # The actual all-reduce happens at the MLIR level when compiled with EXLA
-    # For now, we just return the tensor - in single-device mode this is correct
-    # In multi-device SPMD mode, EXLA will replace this with actual all-reduce
-
-    # TODO: Integrate with EXLA.Collective.all_reduce properly
-    # For now, this is a pass-through that works in single-device testing
-    tensor
+  # The actual all-reduce implementation using EXLA.Nx.all_reduce
+  # This gets lowered to stablehlo.all_reduce when compiled with EXLA
+  defnp all_reduce_impl(tensor, _opts, op, replica_groups) do
+    EXLA.Nx.all_reduce(tensor, op, replica_groups: replica_groups)
   end
 
   @doc """

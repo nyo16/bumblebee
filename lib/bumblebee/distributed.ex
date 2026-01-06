@@ -165,20 +165,47 @@ defmodule Bumblebee.Distributed do
   @spec serving(distributed_model_info(), Bumblebee.Tokenizer.t(), map(), keyword()) ::
           Nx.Serving.t()
   def serving(model_info, tokenizer, generation_config, opts \\ []) do
-    %{model: model, params: params, spec: spec, mesh: _mesh} = model_info
+    %{model: model, params: params, spec: spec, mesh: mesh} = model_info
 
-    # Merge mesh into defn_options
+    tp_size = get_in(mesh, [:axes, :tp]) || 1
+
+    if tp_size > 1 do
+      # TP > 1 with standard Nx.Serving is not yet supported
+      # The all_reduce operations require SPMD execution mode
+      # For now, raise an informative error with guidance
+      raise ArgumentError, """
+      Tensor parallelism with TP > 1 is not yet supported via Nx.Serving.
+
+      Current TP size: #{tp_size}
+
+      For TP > 1 inference, use EXLA.SPMD directly:
+
+          # Build SPMD executable
+          spmd = EXLA.SPMD.build(input_typespecs, output_typespecs, fn builder ->
+            # ... model forward pass with all_reduce ops
+          end, num_replicas: #{tp_size})
+
+          # Run with replica-batched inputs
+          results = EXLA.SPMD.run(spmd, replica_inputs)
+
+      For single-GPU inference with sharded params (simulating TP), use TP=1:
+
+          mesh = Bumblebee.Distributed.mesh(1)
+          {:ok, model_info} = Bumblebee.Distributed.load_model(repo, mesh: mesh, ...)
+
+      The all-reduce NCCL infrastructure is working. See examples/spmd_4gpu_test.exs
+      for a demonstration of 4-GPU all-reduce.
+      """
+    end
+
+    # TP=1: Standard serving with replicated model
     defn_options =
       opts
       |> Keyword.get(:defn_options, [])
-      |> Keyword.merge(
-        compiler: EXLA
-        # For SPMD mode, additional options would go here
-      )
+      |> Keyword.merge(compiler: EXLA)
 
     opts = Keyword.put(opts, :defn_options, defn_options)
 
-    # Use standard generation serving with TP model
     Bumblebee.Text.generation(
       %{model: model, params: params, spec: spec},
       tokenizer,
