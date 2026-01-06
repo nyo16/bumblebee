@@ -337,8 +337,42 @@ build_prefill_spmd = fn batch_size, prompt_len ->
       scale_broadcast = Value.broadcast_in_dim(scale_tensor, [], scores_typespec)
       scores_scaled = Value.multiply(scores, scale_broadcast, scores_typespec)
 
+      # CAUSAL MASKING: Create lower triangular mask
+      # row_indices >= col_indices means we can attend (lower triangular including diagonal)
+      row_typespec = EXLA.Typespec.tensor({:s, 32}, {prompt_len, 1})
+      col_typespec = EXLA.Typespec.tensor({:s, 32}, {1, prompt_len})
+      row_indices = Value.iota(builder, 0, row_typespec)
+      col_indices = Value.iota(builder, 1, col_typespec)
+
+      # Broadcast to [prompt_len, prompt_len]
+      mask_2d_typespec = EXLA.Typespec.tensor({:s, 32}, {prompt_len, prompt_len})
+      row_broadcast = Value.broadcast_in_dim(row_indices, [0, 1], mask_2d_typespec)
+      col_broadcast = Value.broadcast_in_dim(col_indices, [0, 1], mask_2d_typespec)
+
+      # Create causal mask: 1 where row >= col, 0 otherwise
+      causal_mask_int = Value.greater_equal(row_broadcast, col_broadcast, EXLA.Typespec.tensor({:pred, 8}, {prompt_len, prompt_len}))
+
+      # Convert to float and create mask values: 0 for attend, -inf for don't attend
+      neg_inf_scalar = Value.constant(builder, [-1.0e9], scale_typespec)
+      zero_scalar = Value.constant(builder, [0.0], scale_typespec)
+
+      mask_float_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, prompt_len})
+      neg_inf_mask = Value.broadcast_in_dim(neg_inf_scalar, [], mask_float_typespec)
+      zero_mask = Value.broadcast_in_dim(zero_scalar, [], mask_float_typespec)
+
+      # Select: where mask is true (can attend), use 0; else use -inf
+      causal_mask_2d = Value.select(causal_mask_int, zero_mask, neg_inf_mask, mask_float_typespec)
+
+      # Broadcast mask to full attention shape [batch, heads, kv_repeat, prompt_len, prompt_len]
+      mask_5d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, prompt_len, prompt_len})
+      causal_mask_5d = Value.reshape(causal_mask_2d, mask_5d_typespec)
+      causal_mask_broadcast = Value.broadcast_in_dim(causal_mask_5d, [0, 1, 2, 3, 4], scores_typespec)
+
+      # Apply mask to scores
+      scores_masked = Value.add(scores_scaled, causal_mask_broadcast, scores_typespec)
+
       # Apply PROPER softmax
-      attention_weights = softmax.(scores_scaled, scores_typespec, 4)
+      attention_weights = softmax.(scores_masked, scores_typespec, 4)
 
       attn_output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim})
       attn_output = Value.dot_general(attention_weights, v_broadcast, {[4], [0, 1, 2], [3], [0, 1, 2]}, :default, attn_output_typespec)
