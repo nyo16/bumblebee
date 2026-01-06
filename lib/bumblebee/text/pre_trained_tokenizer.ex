@@ -189,6 +189,17 @@ defmodule Bumblebee.Text.PreTrainedTokenizer do
         mask: "<mask>"
       }
     },
+    mpnet: %{
+      special_tokens: %{
+        bos: "<s>",
+        eos: "</s>",
+        unk: "[UNK]",
+        sep: "</s>",
+        pad: "<pad>",
+        cls: "<s>",
+        mask: "<mask>"
+      }
+    },
     nllb: %{
       special_tokens: %{
         eos: "</s>",
@@ -199,6 +210,13 @@ defmodule Bumblebee.Text.PreTrainedTokenizer do
         mask: "<mask>"
       },
       default_template_options: [language_token: "eng_Latn"]
+    },
+    qwen2: %{
+      special_tokens: %{
+        unk: "<|endoftext|>",
+        eos: "<|endoftext|>",
+        pad: "<|endoftext|>"
+      }
     },
     roberta: %{
       special_tokens: %{

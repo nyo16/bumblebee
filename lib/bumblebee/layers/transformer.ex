@@ -25,6 +25,13 @@ defmodule Bumblebee.Layers.Transformer do
       - a keyword list (applied to all blocks)
       - a function that takes the block index and returns the configuration
 
+    * `:attention_window_size` - sliding window attention configuration. Can be:
+      - `nil` for global attention (default)
+      - a `{left, right}` tuple (applied to all blocks)
+      - a function that takes the block index and returns `nil` or `{left, right}`.
+        This enables per-layer attention patterns like Gemma 3's alternating
+        local/global attention (5 local layers followed by 1 global layer)
+
     * `:name` - the prefix for layer names
 
   For all other options (including required options) see `block/2`.
@@ -36,6 +43,8 @@ defmodule Bumblebee.Layers.Transformer do
   def blocks(hidden_state, opts) do
     validate_required_keys!(opts, [:num_blocks, :num_attention_heads, :hidden_size, :ffn])
 
+    # Note: :attention_window_size is NOT in block_opts_keys because it's handled
+    # specially (supports per-layer function) and passed explicitly to block/2
     block_opts_keys = [
       :num_attention_heads,
       :num_key_value_heads,
@@ -52,8 +61,9 @@ defmodule Bumblebee.Layers.Transformer do
       :output_use_bias,
       :layer_norm,
       :block_type,
-      :attention_window_size,
-      :scale_attention_weights
+      :attention_scale,
+      :query_norm,
+      :key_norm
     ]
 
     opts =
@@ -64,6 +74,7 @@ defmodule Bumblebee.Layers.Transformer do
             :name,
             :num_blocks,
             :rotary_embedding,
+            :attention_window_size,
             attention_mask: Layers.none(),
             attention_head_mask: Layers.none(),
             attention_relative_bias: nil,
@@ -85,6 +96,7 @@ defmodule Bumblebee.Layers.Transformer do
     cross_attention_head_mask = opts[:cross_attention_head_mask]
     cache = opts[:cache]
     rotary_embedding = opts[:rotary_embedding]
+    attention_window_size = opts[:attention_window_size]
 
     block_opts = Keyword.take(opts, block_opts_keys)
 
@@ -121,6 +133,15 @@ defmodule Bumblebee.Layers.Transformer do
               config when is_list(config) -> config
             end
 
+          # Support per-layer attention window size for models like Gemma 3
+          # that alternate between local (sliding window) and global attention
+          block_attention_window_size =
+            case attention_window_size do
+              nil -> nil
+              fun when is_function(fun, 1) -> fun.(idx)
+              size -> size
+            end
+
           {hidden_state, attention, cross_attention, block_cache, attention_relative_bias} =
             block(
               state.hidden_state,
@@ -134,6 +155,7 @@ defmodule Bumblebee.Layers.Transformer do
                 block_cache: block_cache,
                 offset: offset,
                 rotary_embedding: block_rotary_embedding,
+                attention_window_size: block_attention_window_size,
                 name: join(name, idx)
               ] ++ block_opts
             )
@@ -274,8 +296,8 @@ defmodule Bumblebee.Layers.Transformer do
     * `:attention_window_size` - when set, enables sliding window attention.
       Should be a `{left, right}` tuple with window size on each side
 
-    * `:scale_attention_weights` - whether to scale query in the traditional style of
-      multi-headed attention. Defaults to `true`
+    * `:attention_scale` - the scaling factor applied to the attention weights.
+      Defaults to $\frac{1}{\sqrt{d}}$.
 
     * `:rotary_embedding` - configuration of rotary embedding. If set,
       will apply rotary position embedding with the given options. Valid
@@ -329,8 +351,10 @@ defmodule Bumblebee.Layers.Transformer do
         block_type: :standard,
         layer_norm: [],
         attention_window_size: nil,
-        scale_attention_weights: true,
-        rotary_embedding: nil
+        attention_scale: nil,
+        rotary_embedding: nil,
+        query_norm: nil,
+        key_norm: nil
       ])
 
     name = opts[:name]
@@ -358,8 +382,10 @@ defmodule Bumblebee.Layers.Transformer do
     layer_norm = opts[:layer_norm]
     block_type = opts[:block_type]
     attention_window_size = opts[:attention_window_size]
-    scale_attention_weights = opts[:scale_attention_weights]
+    attention_scale = opts[:attention_scale]
     rotary_embedding = opts[:rotary_embedding]
+    query_norm = opts[:query_norm]
+    key_norm = opts[:key_norm]
 
     ffn_fun =
       case ffn do
@@ -416,8 +442,10 @@ defmodule Bumblebee.Layers.Transformer do
           value_use_bias: value_use_bias,
           output_use_bias: output_use_bias,
           attention_window_size: attention_window_size,
-          scale_attention_weights: scale_attention_weights,
+          attention_scale: attention_scale,
           rotary_embedding: rotary_embedding,
+          query_norm: query_norm,
+          key_norm: key_norm,
           name: join(name, "self_attention")
         )
 
@@ -461,7 +489,7 @@ defmodule Bumblebee.Layers.Transformer do
           value_use_bias: value_use_bias,
           output_use_bias: output_use_bias,
           attention_window_size: attention_window_size,
-          scale_attention_weights: scale_attention_weights,
+          attention_scale: attention_scale,
           rotary_embedding: rotary_embedding,
           name: join(name, "cross_attention")
         )
@@ -691,8 +719,8 @@ defmodule Bumblebee.Layers.Transformer do
     * `:attention_window_size` - when set, enables sliding window attention.
       Should be a `{left, right}` tuple with window size on each side
 
-    * `:scale_attention_weights` - whether to scale query in the traditional style of
-      multi-headed attention. Defaults to `true`
+    * `:attention_scale` - the scaling factor applied to the attention weights.
+      Defaults to $\frac{1}{\sqrt{d}}$
 
     * `:rotary_embedding` - configuration of rotary embedding. If set,
       will apply rotary position embedding with the given options. Valid
@@ -702,6 +730,14 @@ defmodule Bumblebee.Layers.Transformer do
           embedding
 
         * `:max_positions` - the maximum number of distinct positions
+
+    * `:query_norm` - a function that applies normalization to the query
+      projection before rotary embedding. The function should accept two
+      arguments: the input and a name for the layer. Defaults to `nil`
+
+    * `:key_norm` - a function that applies normalization to the key
+      projection before rotary embedding. The function should accept two
+      arguments: the input and a name for the layer. Defaults to `nil`
 
     * `:name` - the prefix for layer names
 
@@ -726,7 +762,7 @@ defmodule Bumblebee.Layers.Transformer do
         offset: Layers.none(),
         causal: false,
         attention_window_size: nil,
-        scale_attention_weights: true,
+        attention_scale: nil,
         kernel_initializer: :glorot_uniform,
         dropout_rate: 0.0,
         attention_head_size: nil,
@@ -734,7 +770,9 @@ defmodule Bumblebee.Layers.Transformer do
         key_use_bias: true,
         value_use_bias: true,
         output_use_bias: true,
-        rotary_embedding: nil
+        rotary_embedding: nil,
+        query_norm: nil,
+        key_norm: nil
       ])
 
     attention_mask = opts[:attention_mask]
@@ -749,9 +787,11 @@ defmodule Bumblebee.Layers.Transformer do
     kernel_initializer = opts[:kernel_initializer]
     causal = opts[:causal]
     attention_window_size = opts[:attention_window_size]
-    scale_attention_weights = opts[:scale_attention_weights]
+    attention_scale = opts[:attention_scale]
     dropout_rate = opts[:dropout_rate]
     rotary_embedding = opts[:rotary_embedding]
+    query_norm = opts[:query_norm]
+    key_norm = opts[:key_norm]
 
     query_use_bias = opts[:query_use_bias]
     key_use_bias = opts[:key_use_bias]
@@ -790,6 +830,21 @@ defmodule Bumblebee.Layers.Transformer do
         use_bias: value_use_bias
       )
       |> Layers.split_heads(num_key_value_heads)
+
+    # Apply query and key normalization if configured (before rotary embedding)
+    query =
+      if query_norm do
+        query_norm.(query, join(name, "query_norm"))
+      else
+        query
+      end
+
+    key =
+      if key_norm do
+        key_norm.(key, join(name, "key_norm"))
+      else
+        key
+      end
 
     {query, key} =
       case rotary_embedding do
@@ -873,7 +928,7 @@ defmodule Bumblebee.Layers.Transformer do
         attention_head_mask,
         attention_relative_bias,
         offset,
-        scale: scale_attention_weights,
+        scale: attention_scale,
         causal: causal,
         window_size: attention_window_size,
         dropout_rate: dropout_rate
