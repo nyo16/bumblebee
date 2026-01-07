@@ -22,8 +22,9 @@ alias EXLA.MLIR.{Function, Value, Region}
 
 # Configuration
 tp_size = 4
-max_new_tokens = 20
+max_new_tokens = String.to_integer(System.get_env("TOKENS", "20"))
 temperature = 1.0
+use_rope = System.get_env("ROPE", "true") == "true"
 
 # Model size - will be loaded from Mistral 7B
 num_layers = String.to_integer(System.get_env("LAYERS", "2"))  # Use fewer layers for demo
@@ -396,9 +397,13 @@ build_prefill_spmd = fn batch_size, prompt_len ->
       k_transposed_raw = Value.transpose(k_reshaped, [0, 2, 1, 3], k_transposed_typespec)
       v_transposed = Value.transpose(v_reshaped, [0, 2, 1, 3], v_transposed_typespec)
 
-      # Apply RoPE to Q and K
-      q_transposed = apply_rope.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec)
-      k_transposed = apply_rope.(k_transposed_raw, rope_cos, rope_sin, k_transposed_typespec)
+      # Apply RoPE to Q and K (conditionally)
+      {q_transposed, k_transposed} = if use_rope do
+        {apply_rope.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec),
+         apply_rope.(k_transposed_raw, rope_cos, rope_sin, k_transposed_typespec)}
+      else
+        {q_transposed_raw, k_transposed_raw}
+      end
 
       # Store K/V for cache (these will be output) - K already has RoPE applied
       k_cache = k_transposed
@@ -683,18 +688,26 @@ build_decode_spmd = fn batch_size, cache_len ->
       k_new_transposed_raw = Value.transpose(k_new_reshaped, [0, 2, 1, 3], k_new_transposed_typespec)
       v_new_transposed = Value.transpose(v_new_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim}))
 
-      # Apply RoPE to new K (the current position)
-      k_new_transposed = apply_rope_decode.(k_new_transposed_raw, rope_cos, rope_sin, k_new_transposed_typespec)
+      # Apply RoPE to new K (the current position) - conditionally
+      k_new_transposed = if use_rope do
+        apply_rope_decode.(k_new_transposed_raw, rope_cos, rope_sin, k_new_transposed_typespec)
+      else
+        k_new_transposed_raw
+      end
 
       # Concatenate with cache (cached K's already have RoPE applied)
       k_full = Value.concatenate([k_cache_in, k_new_transposed], 2, k_cache_out_typespec)
       v_full = Value.concatenate([v_cache_in, v_new_transposed], 2, v_cache_out_typespec)
 
-      # Reshape Q and apply RoPE
+      # Reshape Q and apply RoPE (conditionally)
       q_reshaped = Value.reshape(q, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_heads, head_dim}))
       q_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, 1, head_dim})
       q_transposed_raw = Value.transpose(q_reshaped, [0, 2, 1, 3], q_transposed_typespec)
-      q_transposed = apply_rope_decode.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec)
+      q_transposed = if use_rope do
+        apply_rope_decode.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec)
+      else
+        q_transposed_raw
+      end
 
       # Grouped query attention
       k_for_attn = Value.transpose(k_full, [0, 1, 3, 2], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, head_dim, new_seq_len}))
@@ -795,7 +808,7 @@ IO.puts("\n" <> ("-" |> String.duplicate(70)))
 IO.puts("Step 4: Tokenizing prompt")
 IO.puts("-" |> String.duplicate(70))
 
-prompt = "The meaning of life is"
+prompt = System.get_env("PROMPT", "The capital of France is")
 IO.puts("  Prompt: \"#{prompt}\"")
 
 tokenized = Bumblebee.apply_tokenizer(tokenizer, prompt)
