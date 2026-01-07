@@ -66,19 +66,23 @@ All working with proper TP sharding and all-reduce:
 
 ---
 
-## Current Limitations
+## Current Status - PROPER IMPLEMENTATION COMPLETE
 
-### 1. Simplified Implementations (For Demonstration)
-- **Embedding lookup**: Uses scaled projection instead of proper gather
-- **Normalization**: Multiplies by weight instead of RMSNorm
-- **Attention**: Exponential approximation instead of proper softmax
+### `examples/tp_4gpu_generate_final.exs`
 
-These are **intentional simplifications** to avoid complex EXLA MLIR API issues:
-- `Value.gather` has enumerable parameter issues
-- `Value.reduce` requires Region construction (complex API)
-- Proper softmax needs custom reduce operations
+**Now Implemented Properly:**
+- **Embedding lookup**: Uses `Value.gather` with correct dimension parameters
+- **RMSNorm**: Uses `Value.reduce` with proper Region construction
+- **Softmax attention**: Uses `Value.reduce` for max and sum operations
+- **Causal masking**: Lower triangular mask using `Value.iota`
+- **RoPE**: Full rotary position embeddings with slice/rotate/concatenate
 
-**Impact**: Output quality is limited, but TP/KV cache infrastructure is proven correct.
+**Generates real English words** - significant improvement over simplified versions!
+
+### Remaining Limitation: Layer Count
+- Tested with 2-8 layers for faster iteration
+- Full 32-layer model needed for fully coherent output
+- Compile time increases with more layers (~15-20s per layer)
 
 ### 2. Fixed Sequence Lengths
 - Each SPMD build is for a specific sequence length
@@ -89,26 +93,17 @@ These are **intentional simplifications** to avoid complex EXLA MLIR API issues:
 
 ## Phase 4 Options - What's Next?
 
-### Option A: Improve Model Quality 🎯
+### Option A: Improve Model Quality 🎯 **COMPLETE!**
 
-Fix the simplifications to get proper text generation:
+✅ **A1. Proper Embedding Lookup** - DONE via `Value.gather`
+✅ **A2. Real RMSNorm** - DONE via `Value.reduce` with Region
+✅ **A3. True Softmax Attention** - DONE via `Value.reduce`
+✅ **A4. Causal Masking** - DONE via `Value.iota` + comparison
+✅ **A5. RoPE** - DONE via `Value.slice`, `Value.concatenate`, rotation formula
 
-#### A1. Proper Embedding Lookup
-- Investigate EXLA gather API issues
-- Or implement one-hot + matmul workaround
-- Would fix initial token representation
-
-#### A2. Real RMSNorm
-- Study EXLA Region API for custom reduce
-- Implement: `x * weight / sqrt(mean(x²) + epsilon)`
-- Critical for model stability
-
-#### A3. True Softmax Attention
-- Implement proper numerically-stable softmax
-- Requires `reduce_max` and `reduce_sum` with Region API
-- Would significantly improve attention quality
-
-**Estimated Effort**: 2-3 days for EXLA API deep-dive
+**All core model operations are now properly implemented!**
+- Tested with 2-8 layers producing English words
+- Full 32 layers needed for coherent text
 
 ---
 
@@ -212,6 +207,7 @@ This would give us proper text generation while keeping the proven TP/KV cache i
 | `tp_4gpu_generate.exs` | Basic generation (O(n²)) | ✅ Working |
 | `tp_4gpu_generate_kvcache.exs` | KV cache generation (O(n)) | ✅ Working |
 | `tp_4gpu_generate_proper.exs` | Exponential attention | ✅ Working |
+| **`tp_4gpu_generate_final.exs`** | **PROPER ops (gather, RMSNorm, softmax, causal mask)** | ✅ **BEST** |
 
 ### Documentation
 | File | Description |

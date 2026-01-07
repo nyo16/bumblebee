@@ -1,4 +1,4 @@
-# 4-GPU Tensor Parallel Text Generation - FINAL VERSION
+# 4-GPU Tensor Parallel Text Generation - FINAL VERSION WITH RoPE
 #
 # This demonstrates production-quality autoregressive generation:
 # - Tensor parallelism across 4 GPUs
@@ -6,6 +6,7 @@
 # - PROPER embedding lookup (gather)
 # - PROPER RMSNorm normalization (reduce)
 # - PROPER softmax attention (reduce)
+# - PROPER Rotary Position Embeddings (RoPE)
 # - Mistral 7B model
 #
 # Usage:
@@ -14,7 +15,7 @@
 Nx.default_backend(EXLA.Backend)
 
 IO.puts("=" |> String.duplicate(70))
-IO.puts("4-GPU TP Generation - FINAL VERSION - Mistral 7B")
+IO.puts("4-GPU TP Generation - FINAL VERSION WITH RoPE - Mistral 7B")
 IO.puts("=" |> String.duplicate(70))
 
 alias EXLA.MLIR.{Function, Value, Region}
@@ -50,6 +51,7 @@ num_heads = spec.num_attention_heads
 num_kv_heads = spec.num_key_value_heads
 head_dim = div(hidden_size, num_heads)
 rms_norm_eps = spec.layer_norm_epsilon
+rope_theta = spec.rotary_embedding_base || 10_000.0
 
 # Tensor parallelism configuration
 local_heads = div(num_heads, tp_size)
@@ -64,6 +66,35 @@ IO.puts("  Vocab size: #{vocab_size}")
 IO.puts("  Hidden size: #{hidden_size}")
 IO.puts("  Using #{num_layers} layers for generation")
 IO.puts("  RMS norm epsilon: #{rms_norm_eps}")
+IO.puts("  RoPE theta: #{rope_theta}")
+
+# Precompute RoPE sin/cos embeddings
+# RoPE formula: inv_freq = 1.0 / (theta^(2i/dim)) for i in 0..dim/2-1
+compute_rope_embeddings = fn max_positions ->
+  # Compute inverse frequencies
+  half_dim = div(head_dim, 2)
+  inv_freq = for i <- 0..(half_dim - 1) do
+    1.0 / :math.pow(rope_theta, 2 * i / head_dim)
+  end
+  inv_freq_tensor = Nx.tensor(inv_freq, type: :f32)
+
+  # Positions: [0, 1, 2, ..., max_positions-1]
+  positions = Nx.iota({max_positions}, type: :f32)
+
+  # Outer product: positions x inv_freq -> [max_positions, half_dim]
+  freqs = Nx.outer(positions, inv_freq_tensor)
+
+  # Compute cos/sin of frequencies
+  cos_freqs = Nx.cos(freqs)  # [max_positions, half_dim]
+  sin_freqs = Nx.sin(freqs)  # [max_positions, half_dim]
+
+  # Standard RoPE: concatenate [cos_freqs, cos_freqs] to get [max_positions, head_dim]
+  # The first half and second half have the same values
+  cos_embed = Nx.concatenate([cos_freqs, cos_freqs], axis: 1)  # [max_positions, head_dim]
+  sin_embed = Nx.concatenate([sin_freqs, sin_freqs], axis: 1)  # [max_positions, head_dim]
+
+  {cos_embed, sin_embed}
+end
 
 # ----------------------------------------------------------
 # Step 2: Extract and shard parameters
@@ -125,17 +156,21 @@ IO.puts("\n" <> ("-" |> String.duplicate(70)))
 IO.puts("Step 3: Building SPMD executables with proper ops")
 IO.puts("-" |> String.duplicate(70))
 
-# Maximum sequence length for KV cache
-max_seq_len = 512
+# Maximum sequence length for KV cache (reserved for future optimization)
+_max_seq_len = 512
 
 # Prefill phase: Process prompt and initialize KV cache
-IO.puts("  Building prefill SPMD (with proper gather, RMSNorm, softmax)...")
+IO.puts("  Building prefill SPMD (with proper gather, RMSNorm, softmax, RoPE)...")
 
 build_prefill_spmd = fn batch_size, prompt_len ->
   input_ids_typespec = EXLA.Typespec.tensor({:s, 32}, {batch_size, prompt_len})
   embed_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
   norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
   lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, vocab_size})
+
+  # RoPE embeddings: [prompt_len, head_dim]
+  rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, head_dim})
+  rope_sin_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, head_dim})
 
   q_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_q_size})
   k_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
@@ -151,7 +186,7 @@ build_prefill_spmd = fn batch_size, prompt_len ->
     gate_typespec, up_typespec, down_typespec
   ], num_layers) |> List.flatten()
 
-  input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec] ++ layer_param_typespecs
+  input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec, rope_cos_typespec, rope_sin_typespec] ++ layer_param_typespecs
 
   # Outputs: logits + K/V caches for each layer
   output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, vocab_size})
@@ -166,7 +201,7 @@ build_prefill_spmd = fn batch_size, prompt_len ->
 
   EXLA.SPMD.build(input_typespecs, output_typespecs, fn builder ->
     args = Function.get_arguments(builder)
-    [input_ids, embed_w, final_norm_w, lm_head_w | layer_args] = args
+    [input_ids, embed_w, final_norm_w, lm_head_w, rope_cos, rope_sin | layer_args] = args
 
     layer_weights = Enum.chunk_every(layer_args, 9)
     |> Enum.map(fn [sa_norm, ffn_norm, q, k, v, o, gate, up, down] ->
@@ -174,6 +209,49 @@ build_prefill_spmd = fn batch_size, prompt_len ->
     end)
 
     hidden_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, hidden_size})
+
+    # RoPE application function
+    # Formula: rotated = x * cos + rotate_half(x) * sin
+    # Where rotate_half([x0, x1, x2, x3, ...]) = [-x1, x0, -x3, x2, ...]
+    apply_rope = fn x, cos_embed, sin_embed, x_typespec ->
+      # x shape: [batch, num_heads, seq_len, head_dim]
+      # cos/sin shape: [seq_len, head_dim]
+
+      # Broadcast cos/sin to match x shape
+      {batch_local, num_heads_local, seq_len_local, _head_dim_local} = x_typespec.shape
+      cos_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, seq_len_local, head_dim})
+      sin_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, seq_len_local, head_dim})
+
+      cos_4d = Value.reshape(cos_embed, cos_4d_typespec)
+      sin_4d = Value.reshape(sin_embed, sin_4d_typespec)
+
+      cos_broadcast = Value.broadcast_in_dim(cos_4d, [0, 1, 2, 3], x_typespec)
+      sin_broadcast = Value.broadcast_in_dim(sin_4d, [0, 1, 2, 3], x_typespec)
+
+      # Create rotate_half(x)
+      # Split x into first half and second half along head_dim
+      half_dim = div(head_dim, 2)
+      first_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+      second_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+
+      # Slice first half: [0:batch, 0:heads, 0:seq, 0:half_dim]
+      x_first = Value.slice(x, [0, 0, 0, 0], [batch_local, num_heads_local, seq_len_local, half_dim], [1, 1, 1, 1], first_half_typespec)
+      # Slice second half: [0:batch, 0:heads, 0:seq, half_dim:head_dim]
+      x_second = Value.slice(x, [0, 0, 0, half_dim], [batch_local, num_heads_local, seq_len_local, head_dim], [1, 1, 1, 1], second_half_typespec)
+
+      # Negate second half
+      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor({:f, 32}, {}))
+      neg_one_broadcast = Value.broadcast_in_dim(neg_one, [], second_half_typespec)
+      x_second_neg = Value.multiply(x_second, neg_one_broadcast, second_half_typespec)
+
+      # rotate_half = concat(-x_second, x_first)
+      x_rotated = Value.concatenate([x_second_neg, x_first], 3, x_typespec)
+
+      # Apply rotation: x * cos + rotate_half(x) * sin
+      x_cos = Value.multiply(x, cos_broadcast, x_typespec)
+      x_rot_sin = Value.multiply(x_rotated, sin_broadcast, x_typespec)
+      Value.add(x_cos, x_rot_sin, x_typespec)
+    end
 
     # PROPER EMBEDDING LOOKUP using gather
     # Gather signature: gather(source, indices, index_vector_dim, slice_sizes, offset_dims, collapsed_slice_dims, start_index_map, typespec)
@@ -244,8 +322,8 @@ build_prefill_spmd = fn batch_size, prompt_len ->
     softmax = fn scores, scores_typespec, seq_dim ->
       # Softmax: exp(x - max(x)) / sum(exp(x - max(x)))
 
-      # Get shape info
-      {batch_size, local_kv_heads, kv_head_repeat, query_len, key_len} = scores_typespec.shape
+      # Get shape info - underscore unused vars to avoid warnings
+      {_batch_size, _local_kv_heads, _kv_head_repeat, _query_len, _key_len} = scores_typespec.shape
 
       # Step 1: Find max along seq_dim
       scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
@@ -310,11 +388,19 @@ build_prefill_spmd = fn batch_size, prompt_len ->
       v_reshaped = Value.reshape(v, EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_kv_heads, head_dim}))
 
       # Transpose to [batch, heads, seq_len, head_dim]
-      q_transposed = Value.transpose(q_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, prompt_len, head_dim}))
-      k_transposed = Value.transpose(k_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim}))
-      v_transposed = Value.transpose(v_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim}))
+      q_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, prompt_len, head_dim})
+      k_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim})
+      v_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim})
 
-      # Store K/V for cache (these will be output)
+      q_transposed_raw = Value.transpose(q_reshaped, [0, 2, 1, 3], q_transposed_typespec)
+      k_transposed_raw = Value.transpose(k_reshaped, [0, 2, 1, 3], k_transposed_typespec)
+      v_transposed = Value.transpose(v_reshaped, [0, 2, 1, 3], v_transposed_typespec)
+
+      # Apply RoPE to Q and K
+      q_transposed = apply_rope.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec)
+      k_transposed = apply_rope.(k_transposed_raw, rope_cos, rope_sin, k_transposed_typespec)
+
+      # Store K/V for cache (these will be output) - K already has RoPE applied
       k_cache = k_transposed
       v_cache = v_transposed
 
@@ -436,6 +522,10 @@ build_decode_spmd = fn batch_size, cache_len ->
   norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
   lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, vocab_size})
 
+  # RoPE embeddings for the single new position: [1, head_dim]
+  rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {1, head_dim})
+  rope_sin_typespec = EXLA.Typespec.tensor({:f, 32}, {1, head_dim})
+
   q_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_q_size})
   k_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
   v_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
@@ -455,7 +545,7 @@ build_decode_spmd = fn batch_size, cache_len ->
   v_cache_in_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, cache_len, head_dim})
   cache_in_typespecs = List.duplicate([k_cache_in_typespec, v_cache_in_typespec], num_layers) |> List.flatten()
 
-  input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec] ++ layer_param_typespecs ++ cache_in_typespecs
+  input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec, rope_cos_typespec, rope_sin_typespec] ++ layer_param_typespecs ++ cache_in_typespecs
 
   # Outputs: logits + updated K/V caches
   output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, vocab_size})
@@ -468,7 +558,7 @@ build_decode_spmd = fn batch_size, cache_len ->
 
   EXLA.SPMD.build(input_typespecs, output_typespecs, fn builder ->
     args = Function.get_arguments(builder)
-    [input_ids, embed_w, final_norm_w, lm_head_w | rest_args] = args
+    [input_ids, embed_w, final_norm_w, lm_head_w, rope_cos, rope_sin | rest_args] = args
 
     # Split into layer params (9 per layer) and caches (2 per layer)
     num_param_args = num_layers * 9
@@ -490,6 +580,42 @@ build_decode_spmd = fn batch_size, cache_len ->
     end)
 
     hidden_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, hidden_size})
+
+    # RoPE application function for decode (single position)
+    apply_rope_decode = fn x, cos_embed, sin_embed, x_typespec ->
+      # x shape: [batch, num_heads, 1, head_dim]
+      # cos/sin shape: [1, head_dim]
+
+      {batch_local, num_heads_local, seq_len_local, _head_dim_local} = x_typespec.shape
+      cos_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, head_dim})
+      sin_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, head_dim})
+
+      cos_4d = Value.reshape(cos_embed, cos_4d_typespec)
+      sin_4d = Value.reshape(sin_embed, sin_4d_typespec)
+
+      cos_broadcast = Value.broadcast_in_dim(cos_4d, [0, 1, 2, 3], x_typespec)
+      sin_broadcast = Value.broadcast_in_dim(sin_4d, [0, 1, 2, 3], x_typespec)
+
+      # Create rotate_half(x)
+      half_dim = div(head_dim, 2)
+      first_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+      second_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+
+      # Slice first half: [0:batch, 0:heads, 0:seq, 0:half_dim]
+      x_first = Value.slice(x, [0, 0, 0, 0], [batch_local, num_heads_local, seq_len_local, half_dim], [1, 1, 1, 1], first_half_typespec)
+      # Slice second half: [0:batch, 0:heads, 0:seq, half_dim:head_dim]
+      x_second = Value.slice(x, [0, 0, 0, half_dim], [batch_local, num_heads_local, seq_len_local, head_dim], [1, 1, 1, 1], second_half_typespec)
+
+      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor({:f, 32}, {}))
+      neg_one_broadcast = Value.broadcast_in_dim(neg_one, [], second_half_typespec)
+      x_second_neg = Value.multiply(x_second, neg_one_broadcast, second_half_typespec)
+
+      x_rotated = Value.concatenate([x_second_neg, x_first], 3, x_typespec)
+
+      x_cos = Value.multiply(x, cos_broadcast, x_typespec)
+      x_rot_sin = Value.multiply(x_rotated, sin_broadcast, x_typespec)
+      Value.add(x_cos, x_rot_sin, x_typespec)
+    end
 
     # PROPER EMBEDDING LOOKUP using gather (for single token)
     hidden_states = Value.gather(
@@ -553,16 +679,22 @@ build_decode_spmd = fn batch_size, cache_len ->
       k_new_reshaped = Value.reshape(k_new, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_heads, head_dim}))
       v_new_reshaped = Value.reshape(v_new, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_heads, head_dim}))
 
-      k_new_transposed = Value.transpose(k_new_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim}))
+      k_new_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim})
+      k_new_transposed_raw = Value.transpose(k_new_reshaped, [0, 2, 1, 3], k_new_transposed_typespec)
       v_new_transposed = Value.transpose(v_new_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim}))
 
-      # Concatenate with cache
+      # Apply RoPE to new K (the current position)
+      k_new_transposed = apply_rope_decode.(k_new_transposed_raw, rope_cos, rope_sin, k_new_transposed_typespec)
+
+      # Concatenate with cache (cached K's already have RoPE applied)
       k_full = Value.concatenate([k_cache_in, k_new_transposed], 2, k_cache_out_typespec)
       v_full = Value.concatenate([v_cache_in, v_new_transposed], 2, v_cache_out_typespec)
 
-      # Reshape Q
+      # Reshape Q and apply RoPE
       q_reshaped = Value.reshape(q, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_heads, head_dim}))
-      q_transposed = Value.transpose(q_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, 1, head_dim}))
+      q_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, 1, head_dim})
+      q_transposed_raw = Value.transpose(q_reshaped, [0, 2, 1, 3], q_transposed_typespec)
+      q_transposed = apply_rope_decode.(q_transposed_raw, rope_cos, rope_sin, q_transposed_typespec)
 
       # Grouped query attention
       k_for_attn = Value.transpose(k_full, [0, 1, 3, 2], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, head_dim, new_seq_len}))
@@ -685,7 +817,7 @@ IO.puts("  (This may take a while due to proper gather/reduce/softmax...)")
 prefill_spmd = build_prefill_spmd.(1, prompt_length)
 
 # Prepare replica inputs
-prepare_prefill_inputs = fn input_ids ->
+prepare_prefill_inputs = fn input_ids, rope_cos, rope_sin ->
   for gpu <- 0..(tp_size - 1) do
     layer_params_for_gpu = Enum.flat_map(layer_params, fn layer ->
       [
@@ -697,12 +829,13 @@ prepare_prefill_inputs = fn input_ids ->
       ]
     end)
 
-    [input_ids, embed_tokens, final_norm_weight, lm_head_kernel] ++ layer_params_for_gpu
+    [input_ids, embed_tokens, final_norm_weight, lm_head_kernel, rope_cos, rope_sin] ++ layer_params_for_gpu
   end
 end
 
 IO.puts("  Running prefill on #{tp_size} GPUs...")
-replica_inputs = prepare_prefill_inputs.(input_ids)
+{rope_cos_prefill, rope_sin_prefill} = compute_rope_embeddings.(prompt_length)
+replica_inputs = prepare_prefill_inputs.(input_ids, rope_cos_prefill, rope_sin_prefill)
 
 {time_us, results} = :timer.tc(fn ->
   EXLA.SPMD.run(prefill_spmd, replica_inputs)
@@ -731,8 +864,14 @@ IO.puts("Step 6: Generating text with KV cache (#{max_new_tokens - 1} more token
 IO.puts("-" |> String.duplicate(70))
 
 # Prepare decode inputs function
-prepare_decode_inputs = fn token_id, caches ->
+prepare_decode_inputs = fn token_id, caches, position ->
   token_tensor = Nx.tensor([[token_id]], type: :s32)
+
+  # Get RoPE embeddings for this specific position
+  {full_cos, full_sin} = compute_rope_embeddings.(position + 1)
+  # Slice out just the position we need (the last one)
+  rope_cos_pos = Nx.slice(full_cos, [position, 0], [1, head_dim])
+  rope_sin_pos = Nx.slice(full_sin, [position, 0], [1, head_dim])
 
   for gpu <- 0..(tp_size - 1) do
     layer_params_for_gpu = Enum.flat_map(layer_params, fn layer ->
@@ -745,7 +884,7 @@ prepare_decode_inputs = fn token_id, caches ->
       ]
     end)
 
-    [token_tensor, embed_tokens, final_norm_weight, lm_head_kernel] ++ layer_params_for_gpu ++ caches
+    [token_tensor, embed_tokens, final_norm_weight, lm_head_kernel, rope_cos_pos, rope_sin_pos] ++ layer_params_for_gpu ++ caches
   end
 end
 
@@ -761,8 +900,9 @@ Enum.reduce(1..(max_new_tokens - 1), {generated_tokens, current_caches, current_
   decode_spmd = build_decode_spmd.(1, cache_len)
 
   # Prepare inputs with last generated token
+  # Position is cache_len (the position of the new token being generated)
   last_token = List.last(tokens)
-  replica_inputs = prepare_decode_inputs.(last_token, caches)
+  replica_inputs = prepare_decode_inputs.(last_token, caches, cache_len)
 
   # Run decode
   [[new_logits | new_caches] | _] = EXLA.SPMD.run(decode_spmd, replica_inputs)
@@ -796,12 +936,14 @@ full_text = Bumblebee.Tokenizer.decode(tokenizer, full_tokens)
 
 IO.puts("""
 
-✓ COMPLETE - Proper Operations with Full Generation!
+✓ COMPLETE - Proper Operations with Full Generation + RoPE!
 
 Implemented:
   - PROPER embedding lookup via Value.gather
   - PROPER RMSNorm via Value.reduce
   - PROPER softmax attention via Value.reduce
+  - PROPER causal masking via Value.iota
+  - PROPER Rotary Position Embeddings (RoPE)
   - Full autoregressive generation with KV cache
 
 Prompt: "#{prompt}"
