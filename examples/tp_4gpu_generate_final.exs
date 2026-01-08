@@ -23,7 +23,9 @@ alias EXLA.MLIR.{Function, Value, Region}
 # Configuration
 tp_size = 4
 max_new_tokens = String.to_integer(System.get_env("TOKENS", "20"))
-temperature = 1.0
+temperature = String.to_float(System.get_env("TEMP", "0.7"))
+top_k = String.to_integer(System.get_env("TOP_K", "50"))
+top_p = String.to_float(System.get_env("TOP_P", "0.9"))
 use_rope = System.get_env("ROPE", "true") == "true"
 
 # Model size - will be loaded from Mistral 7B
@@ -33,6 +35,8 @@ IO.puts("\nConfiguration:")
 IO.puts("  TP size: #{tp_size}")
 IO.puts("  Max new tokens: #{max_new_tokens}")
 IO.puts("  Temperature: #{temperature}")
+IO.puts("  Top-k: #{top_k}")
+IO.puts("  Top-p: #{top_p}")
 
 # ----------------------------------------------------------
 # Step 1: Load model and tokenizer
@@ -95,6 +99,64 @@ compute_rope_embeddings = fn max_positions ->
   sin_embed = Nx.concatenate([sin_freqs, sin_freqs], axis: 1)  # [max_positions, head_dim]
 
   {cos_embed, sin_embed}
+end
+
+# Sampling function with temperature, top-k, and top-p
+sample_token = fn logits, key, temp, k, p ->
+  # logits shape: {batch_size, vocab_size} - we assume batch_size=1
+  logits_1d = Nx.squeeze(logits, axes: [0])  # {vocab_size}
+
+  # Apply temperature
+  scaled_logits = if temp > 0 do
+    Nx.divide(logits_1d, temp)
+  else
+    logits_1d
+  end
+
+  # Get top-k indices and values
+  {top_values, top_indices} = Nx.top_k(scaled_logits, k: k)
+
+  # Apply softmax to get probabilities
+  max_val = Nx.reduce_max(top_values)
+  shifted = Nx.subtract(top_values, max_val)
+  exp_vals = Nx.exp(shifted)
+  sum_exp = Nx.sum(exp_vals)
+  probs = Nx.divide(exp_vals, sum_exp)
+
+  # Apply top-p (nucleus) filtering
+  sorted_probs = probs  # already sorted by top_k
+  cumsum = Nx.cumulative_sum(sorted_probs)
+
+  # Find cutoff index where cumsum > p
+  mask = Nx.less_equal(cumsum, p)
+  # Always keep at least one token
+  mask = Nx.put_slice(mask, [0], Nx.tensor([1], type: :u8))
+
+  # Zero out probabilities beyond top-p
+  filtered_probs = Nx.select(mask, probs, Nx.tensor(0.0))
+
+  # Renormalize
+  filtered_sum = Nx.sum(filtered_probs)
+  final_probs = Nx.divide(filtered_probs, filtered_sum)
+
+  # Sample from categorical distribution
+  {rand_val, new_key} = Nx.Random.uniform(key, 0.0, 1.0, shape: {}, type: :f32)
+  rand_val = Nx.to_number(rand_val)
+
+  # Find which bucket the random value falls into
+  cumsum_final = Nx.cumulative_sum(final_probs)
+  cumsum_list = Nx.to_flat_list(cumsum_final)
+  indices_list = Nx.to_flat_list(top_indices)
+
+  sampled_idx = Enum.zip(cumsum_list, indices_list)
+  |> Enum.find_value(fn {cum, idx} ->
+    if rand_val <= cum, do: idx, else: nil
+  end)
+
+  # Fallback to first token if nothing found (shouldn't happen)
+  sampled_idx = sampled_idx || hd(indices_list)
+
+  {trunc(sampled_idx), new_key}
 end
 
 # ----------------------------------------------------------
@@ -868,8 +930,15 @@ IO.puts("    Logits: #{inspect(Nx.shape(logits))}")
 IO.puts("    Number of K/V cache pairs: #{div(length(kv_caches), 2)}")
 IO.puts("    K cache shape (per layer): #{inspect(Nx.shape(hd(kv_caches)))}")
 
-# Sample first token
-next_token = Nx.argmax(logits, axis: 1) |> Nx.to_flat_list() |> hd()
+# Initialize random key for sampling
+random_key = Nx.Random.key(System.system_time(:nanosecond))
+
+# Sample first token (with temperature/top-k/top-p if temp > 0)
+{next_token, random_key} = if temperature > 0 do
+  sample_token.(logits, random_key, temperature, top_k, top_p)
+else
+  {Nx.argmax(logits, axis: 1) |> Nx.to_flat_list() |> hd(), random_key}
+end
 IO.puts("\n  First generated token: #{next_token}")
 IO.puts("  Decoded: \"#{Bumblebee.Tokenizer.decode(tokenizer, [next_token])}\"")
 
@@ -905,6 +974,9 @@ prepare_decode_inputs = fn token_id, caches, position ->
   end
 end
 
+# EOS token for stopping generation
+eos_token_id = 2  # Mistral EOS token
+
 # Generate tokens with decode phase
 generated_tokens = [next_token]
 current_caches = kv_caches
@@ -912,32 +984,49 @@ current_cache_len = prompt_length
 
 IO.write("  Generated text: #{Bumblebee.Tokenizer.decode(tokenizer, [next_token])}")
 
-{final_generated_tokens, _, _} = Enum.reduce(1..(max_new_tokens - 1), {generated_tokens, current_caches, current_cache_len}, fn i, {tokens, caches, cache_len} ->
-  # Build decode SPMD for current cache length
-  decode_spmd = build_decode_spmd.(1, cache_len)
+# Check if first token is already EOS
+initial_finished = next_token == eos_token_id
 
-  # Prepare inputs with last generated token
-  # Position is cache_len (the position of the new token being generated)
-  last_token = List.last(tokens)
-  replica_inputs = prepare_decode_inputs.(last_token, caches, cache_len)
+{final_generated_tokens, _, _, _} = if initial_finished do
+  {generated_tokens, current_caches, current_cache_len, random_key}
+else
+  Enum.reduce_while(1..(max_new_tokens - 1), {generated_tokens, current_caches, current_cache_len, random_key}, fn i, {tokens, caches, cache_len, key} ->
+    # Build decode SPMD for current cache length
+    decode_spmd = build_decode_spmd.(1, cache_len)
 
-  # Run decode
-  [[new_logits | new_caches] | _] = EXLA.SPMD.run(decode_spmd, replica_inputs)
+    # Prepare inputs with last generated token
+    # Position is cache_len (the position of the new token being generated)
+    last_token = List.last(tokens)
+    replica_inputs = prepare_decode_inputs.(last_token, caches, cache_len)
 
-  # Sample next token
-  new_token = Nx.argmax(new_logits, axis: 1) |> Nx.to_flat_list() |> hd()
+    # Run decode
+    [[new_logits | new_caches] | _] = EXLA.SPMD.run(decode_spmd, replica_inputs)
 
-  # Print token
-  IO.write(Bumblebee.Tokenizer.decode(tokenizer, [new_token]))
+    # Sample next token (with temperature/top-k/top-p if temp > 0)
+    {new_token, new_key} = if temperature > 0 do
+      sample_token.(new_logits, key, temperature, top_k, top_p)
+    else
+      {Nx.argmax(new_logits, axis: 1) |> Nx.to_flat_list() |> hd(), key}
+    end
 
-  # Progress indicator every 5 tokens
-  if rem(i, 5) == 0 do
-    IO.write(" [#{i}/#{max_new_tokens - 1}]")
-  end
+    # Print token (streaming)
+    decoded_token = Bumblebee.Tokenizer.decode(tokenizer, [new_token])
+    IO.write(decoded_token)
 
-  # Return updated state
-  {tokens ++ [new_token], new_caches, cache_len + 1}
-end)
+    # Progress indicator every 5 tokens
+    if rem(i, 5) == 0 do
+      IO.write(" [#{i}/#{max_new_tokens - 1}]")
+    end
+
+    # Check for EOS token
+    if new_token == eos_token_id do
+      IO.write(" [EOS]")
+      {:halt, {tokens ++ [new_token], new_caches, cache_len + 1, new_key}}
+    else
+      {:cont, {tokens ++ [new_token], new_caches, cache_len + 1, new_key}}
+    end
+  end)
+end
 
 IO.puts("")
 
