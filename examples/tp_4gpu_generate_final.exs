@@ -1059,13 +1059,20 @@ end)
 
 IO.puts("  Prefill completed in #{Float.round(time_us / 1000, 2)} ms")
 
-# Extract results
-[[logits | kv_caches] | _] = results
+# Extract results - need ALL replicas' KV caches (each GPU has local heads)
+# results is [[logits | kv_caches], [logits | kv_caches], [logits | kv_caches], [logits | kv_caches]]
+# We take logits from first replica (they're all-reduced so identical)
+# But we need KV caches from EACH replica
+[[logits | _] | _] = results
+kv_caches_per_replica = for replica_result <- results do
+  [_ | kv_caches] = replica_result
+  kv_caches
+end
 
 IO.puts("\n  Output shapes:")
 IO.puts("    Logits: #{inspect(Nx.shape(logits))}")
-IO.puts("    Number of K/V cache pairs: #{div(length(kv_caches), 2)}")
-IO.puts("    K cache shape (per layer): #{inspect(Nx.shape(hd(kv_caches)))}")
+IO.puts("    Number of K/V cache pairs per GPU: #{div(length(hd(kv_caches_per_replica)), 2)}")
+IO.puts("    K cache shape (per layer): #{inspect(Nx.shape(hd(hd(kv_caches_per_replica))))}")
 
 # Initialize random key for sampling
 random_key = Nx.Random.key(System.system_time(:nanosecond))
@@ -1144,7 +1151,7 @@ eos_token_id = 2  # Mistral EOS token
 # Phase 4: Generate tokens with decode phase (batch-aware)
 # Track generated tokens per batch item
 generated_tokens_per_batch = for tok <- next_tokens, do: [tok]
-current_caches = kv_caches
+current_caches_per_replica = kv_caches_per_replica  # Per-GPU caches
 current_position = prompt_length  # Position for next token
 
 # Phase 4: Track finished status per batch
@@ -1177,7 +1184,8 @@ IO.write("  Generated text: #{Bumblebee.Tokenizer.decode(tokenizer, hd(next_toke
 all_finished = Enum.all?(finished_mask)
 
 # Phase 4: Prepare batch decode inputs (all batch items with same position)
-prepare_batch_decode_inputs = fn tokens_per_batch, position, caches ->
+# NOTE: caches_per_replica is a list of 4 cache lists (one per GPU)
+prepare_batch_decode_inputs = fn tokens_per_batch, position, caches_per_replica ->
   # Create batch token tensor from last token of each batch
   last_tokens = Enum.map(tokens_per_batch, &List.last/1)
   token_tensor = Nx.tensor([last_tokens], type: :s32) |> Nx.transpose()  # {batch_size, 1}
@@ -1198,19 +1206,28 @@ prepare_batch_decode_inputs = fn tokens_per_batch, position, caches ->
       ]
     end)
 
-    [token_tensor, position_tensor, embed_tokens, final_norm_weight, lm_head_kernel, rope_cos_pos, rope_sin_pos] ++ layer_params_for_gpu ++ caches
+    # Use each GPU's own cache!
+    gpu_caches = Enum.at(caches_per_replica, gpu)
+    [token_tensor, position_tensor, embed_tokens, final_norm_weight, lm_head_kernel, rope_cos_pos, rope_sin_pos] ++ layer_params_for_gpu ++ gpu_caches
   end
 end
 
 {final_generated_tokens_per_batch, _, _, _, _} = if all_finished do
-  {generated_tokens_per_batch, current_caches, current_position, random_key, finished_mask}
+  {generated_tokens_per_batch, current_caches_per_replica, current_position, random_key, finished_mask}
 else
-  Enum.reduce_while(1..(actual_max_new_tokens - 1), {generated_tokens_per_batch, current_caches, current_position, random_key, finished_mask}, fn i, {tokens_per_batch, caches, position, key, finished} ->
+  Enum.reduce_while(1..(actual_max_new_tokens - 1), {generated_tokens_per_batch, current_caches_per_replica, current_position, random_key, finished_mask}, fn i, {tokens_per_batch, caches_per_replica, position, key, finished} ->
     # Phase 3: Use pre-compiled decode SPMD (no recompilation!)
-    replica_inputs = prepare_batch_decode_inputs.(tokens_per_batch, position, caches)
+    replica_inputs = prepare_batch_decode_inputs.(tokens_per_batch, position, caches_per_replica)
 
-    # Run decode
-    [[new_logits | new_caches] | _] = EXLA.SPMD.run(decode_spmd_fixed, replica_inputs)
+    # Run decode - need ALL replicas' updated caches
+    decode_results = EXLA.SPMD.run(decode_spmd_fixed, replica_inputs)
+    # Take logits from first replica (all-reduced so identical)
+    [[new_logits | _] | _] = decode_results
+    # Extract updated caches from each replica
+    new_caches_per_replica = for replica_result <- decode_results do
+      [_ | new_caches] = replica_result
+      new_caches
+    end
 
     # Phase 4: Sample next token for each batch item
     {new_tokens, new_key} = Enum.reduce(0..(batch_size - 1), {[], key}, fn b, {tokens, k} ->
@@ -1259,9 +1276,9 @@ else
 
     # Check if all finished
     if Enum.all?(new_finished) do
-      {:halt, {new_tokens_per_batch, new_caches, position + 1, new_key, new_finished}}
+      {:halt, {new_tokens_per_batch, new_caches_per_replica, position + 1, new_key, new_finished}}
     else
-      {:cont, {new_tokens_per_batch, new_caches, position + 1, new_key, new_finished}}
+      {:cont, {new_tokens_per_batch, new_caches_per_replica, position + 1, new_key, new_finished}}
     end
   end)
 end
