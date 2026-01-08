@@ -56,9 +56,16 @@ alias EXLA.MLIR.{Function, Value, Region}
 # Configuration
 tp_size = 4
 max_new_tokens = String.to_integer(System.get_env("TOKENS", "20"))
-temperature = String.to_float(System.get_env("TEMP", "0.7"))
+# Parse float that handles both "0" and "0.7" formats
+parse_float = fn str ->
+  case Float.parse(str) do
+    {f, _} -> f
+    :error -> String.to_float(str)
+  end
+end
+temperature = parse_float.(System.get_env("TEMP", "0.7"))
 top_k = String.to_integer(System.get_env("TOP_K", "50"))
-top_p = String.to_float(System.get_env("TOP_P", "0.9"))
+top_p = parse_float.(System.get_env("TOP_P", "0.9"))
 use_rope = System.get_env("ROPE", "true") == "true"
 
 # Phase 3: Pre-allocated KV cache configuration
@@ -297,10 +304,10 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
   input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec, rope_cos_typespec, rope_sin_typespec] ++ layer_param_typespecs
 
   # Outputs: logits + K/V caches for each layer (pre-allocated to max_seq_len)
-  output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size_local, vocab_size})
+  output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, vocab_size})
   # Phase 3: Caches are pre-allocated to max_seq_len
-  k_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size_local, local_kv_heads, max_seq_len_local, head_dim})
-  v_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size_local, local_kv_heads, max_seq_len_local, head_dim})
+  k_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+  v_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
 
   # One K and V cache per layer
   cache_typespecs = List.duplicate([k_cache_typespec, v_cache_typespec], num_layers) |> List.flatten()
