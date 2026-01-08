@@ -167,7 +167,8 @@ build_prefill_spmd = fn batch_size, prompt_len ->
   input_ids_typespec = EXLA.Typespec.tensor({:s, 32}, {batch_size, prompt_len})
   embed_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
   norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
-  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, vocab_size})
+  # NOTE: lm_head_kernel shape is {vocab_size, hidden_size} - NOT tied to embeddings in Mistral!
+  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
 
   # RoPE embeddings: [prompt_len, head_dim]
   rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, head_dim})
@@ -505,7 +506,8 @@ build_prefill_spmd = fn batch_size, prompt_len ->
     last_hidden = Value.slice(normed_output, [0, prompt_len - 1, 0], [batch_size, prompt_len, hidden_size], [1, 1, 1], last_hidden_typespec)
     last_hidden_2d = Value.reshape(last_hidden, EXLA.Typespec.tensor({:f, 32}, {batch_size, hidden_size}))
 
-    logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [0], []}, :default, output_typespec)
+    # lm_head_w is {vocab, hidden}, contract hidden dims: axis 1 of hidden with axis 1 of lm_head
+    logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [1], []}, :default, output_typespec)
 
     # Return logits + all K/V caches
     [logits] ++ kv_caches
@@ -525,7 +527,8 @@ build_decode_spmd = fn batch_size, cache_len ->
   input_ids_typespec = EXLA.Typespec.tensor({:s, 32}, {batch_size, 1})
   embed_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
   norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
-  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, vocab_size})
+  # NOTE: lm_head_kernel shape is {vocab_size, hidden_size} - NOT tied to embeddings in Mistral!
+  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
 
   # RoPE embeddings for the single new position: [1, head_dim]
   rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {1, head_dim})
@@ -792,7 +795,8 @@ build_decode_spmd = fn batch_size, cache_len ->
     # Final norm + LM head
     normed_output = rms_norm.(final_hidden, final_norm_w, hidden_typespec)
     last_hidden_2d = Value.reshape(normed_output, EXLA.Typespec.tensor({:f, 32}, {batch_size, hidden_size}))
-    logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [0], []}, :default, output_typespec)
+    # lm_head_w is {vocab, hidden}, contract hidden dims: axis 1 of hidden with axis 1 of lm_head
+    logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [1], []}, :default, output_typespec)
 
     [logits] ++ updated_caches
   end, num_replicas: tp_size, client: :cuda)
@@ -908,7 +912,7 @@ current_cache_len = prompt_length
 
 IO.write("  Generated text: #{Bumblebee.Tokenizer.decode(tokenizer, [next_token])}")
 
-Enum.reduce(1..(max_new_tokens - 1), {generated_tokens, current_caches, current_cache_len}, fn i, {tokens, caches, cache_len} ->
+{final_generated_tokens, _, _} = Enum.reduce(1..(max_new_tokens - 1), {generated_tokens, current_caches, current_cache_len}, fn i, {tokens, caches, cache_len} ->
   # Build decode SPMD for current cache length
   decode_spmd = build_decode_spmd.(1, cache_len)
 
@@ -944,7 +948,7 @@ IO.puts("\n" <> ("=" |> String.duplicate(70)))
 IO.puts("Summary")
 IO.puts("=" |> String.duplicate(70))
 
-full_tokens = Nx.to_flat_list(input_ids) ++ generated_tokens
+full_tokens = Nx.to_flat_list(input_ids) ++ final_generated_tokens
 full_text = Bumblebee.Tokenizer.decode(tokenizer, full_tokens)
 
 IO.puts("""
