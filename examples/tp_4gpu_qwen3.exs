@@ -20,6 +20,184 @@
 #   TOP_K     - Top-k filtering (default: 50)
 #   TOP_P     - Nucleus sampling threshold (default: 0.9)
 #   MAX_SEQ   - Pre-allocated cache size (default: 128)
+#   MEM_FRAC  - GPU memory fraction to allocate (default: auto-calculated)
+
+# =============================================================================
+# MEMORY CALCULATION - Must happen BEFORE EXLA client initialization
+# =============================================================================
+# Formula for LLM inference memory:
+#   Model weights = num_params × bytes_per_param
+#   KV Cache = 2 × batch × seq_len × layers × kv_heads × head_dim × bytes
+#   Total ≈ weights + kv_cache + activations (small)
+
+defmodule MemoryCalculator do
+  @moduledoc """
+  Calculate GPU memory requirements for LLM inference.
+
+  Memory components:
+  1. Model weights (sharded by TP)
+  2. KV cache (sharded by TP)
+  3. Attention score matrices: batch × heads × seq × seq
+  4. FFN intermediate activations: batch × seq × intermediate_size
+  5. XLA compilation buffers (~1-2GB per device)
+  6. NCCL communication buffers (~512MB per device)
+  7. CUDA context overhead (~500MB per device)
+  """
+
+  # Qwen3-4B-Instruct specs
+  @hidden_size 2560
+  @num_layers 36
+  @num_heads 32
+  @num_kv_heads 8
+  @head_dim 128
+  @intermediate_size 9728
+  @vocab_size 151_936
+  @bytes_per_param 4  # f32
+
+  def calculate(opts \\ []) do
+    num_layers = Keyword.get(opts, :num_layers, @num_layers)
+    max_seq_len = Keyword.get(opts, :max_seq_len, 128)
+    batch_size = Keyword.get(opts, :batch_size, 1)
+    tp_size = Keyword.get(opts, :tp_size, 4)
+
+    # 1. Model parameters (total, then we'll shard)
+    embedding_params = @vocab_size * @hidden_size
+    per_layer_params =
+      (@hidden_size * @num_heads * @head_dim) +      # Q
+      (@hidden_size * @num_kv_heads * @head_dim) +   # K
+      (@hidden_size * @num_kv_heads * @head_dim) +   # V
+      (@num_heads * @head_dim * @hidden_size) +      # O
+      @head_dim + @head_dim +                        # QK norms
+      (@hidden_size * @intermediate_size) * 3 +      # FFN (gate, up, down)
+      @hidden_size * 2                               # layer norms
+
+    total_params = embedding_params + (per_layer_params * num_layers) + @hidden_size
+    model_bytes = total_params * @bytes_per_param
+    # Embedding is replicated, attention/FFN sharded by TP
+    model_bytes_per_gpu = (embedding_params * @bytes_per_param) +
+                          ((total_params - embedding_params) * @bytes_per_param / tp_size)
+
+    # 2. KV cache per GPU (kv_heads are sharded)
+    local_kv_heads = @num_kv_heads / tp_size
+    kv_cache_bytes_per_gpu = 2 * batch_size * max_seq_len * num_layers *
+                             local_kv_heads * @head_dim * @bytes_per_param
+
+    # 3. Attention score matrix: batch × local_heads × seq × seq
+    local_heads = @num_heads / tp_size
+    attention_scores_bytes = batch_size * local_heads * max_seq_len * max_seq_len * @bytes_per_param
+
+    # 4. FFN intermediate activations per GPU
+    local_intermediate = @intermediate_size / tp_size
+    ffn_activation_bytes = batch_size * max_seq_len * local_intermediate * @bytes_per_param * 2  # gate + up
+
+    # 5. Hidden state activations (replicated per layer)
+    hidden_activation_bytes = batch_size * max_seq_len * @hidden_size * @bytes_per_param
+
+    # Peak activation memory (attention OR FFN, whichever is larger, times some layers in flight)
+    peak_activation_bytes = max(attention_scores_bytes, ffn_activation_bytes) +
+                            hidden_activation_bytes * 2  # input + output buffers
+
+    # 6. XLA compilation buffers - SPMD compilation uses significant temporary memory
+    # Empirically observed: ~4-6GB for complex SPMD graphs with many layers
+    xla_compilation_bytes = 5.0 * 1024 * 1024 * 1024
+
+    # 7. NCCL communication buffers (~1 GB for all-reduce with large tensors)
+    nccl_buffer_bytes = 1024 * 1024 * 1024
+
+    # 8. CUDA context overhead (~500 MB)
+    cuda_overhead_bytes = 500 * 1024 * 1024
+
+    # 9. XLA temporary buffers during execution (intermediate results, fusion buffers)
+    # These can be significant for transformer attention operations
+    xla_temp_execution_bytes = 2.0 * 1024 * 1024 * 1024
+
+    # Subtotals
+    compute_bytes = model_bytes_per_gpu + kv_cache_bytes_per_gpu + peak_activation_bytes
+    overhead_bytes = xla_compilation_bytes + nccl_buffer_bytes + cuda_overhead_bytes + xla_temp_execution_bytes
+
+    # Total per GPU
+    total_per_gpu_bytes = compute_bytes + overhead_bytes
+
+    # Add 30% safety margin for unforeseen allocations
+    total_with_margin = total_per_gpu_bytes * 1.3
+
+    %{
+      model_gb: model_bytes / (1024 * 1024 * 1024),
+      model_per_gpu_gb: model_bytes_per_gpu / (1024 * 1024 * 1024),
+      kv_cache_per_gpu_mb: kv_cache_bytes_per_gpu / (1024 * 1024),
+      attention_mb: attention_scores_bytes / (1024 * 1024),
+      ffn_activation_mb: ffn_activation_bytes / (1024 * 1024),
+      xla_compile_gb: xla_compilation_bytes / (1024 * 1024 * 1024),
+      xla_temp_gb: xla_temp_execution_bytes / (1024 * 1024 * 1024),
+      nccl_overhead_gb: nccl_buffer_bytes / (1024 * 1024 * 1024),
+      cuda_overhead_mb: cuda_overhead_bytes / (1024 * 1024),
+      total_per_gpu_gb: total_with_margin / (1024 * 1024 * 1024),
+      total_params: total_params
+    }
+  end
+
+  def recommended_memory_fraction(_opts \\ []) do
+    # vLLM-style approach: use most of GPU memory
+    # The calculated estimate is informational only - XLA/SPMD needs more buffer
+    # than simple calculations predict due to:
+    # - SPMD compilation intermediate buffers
+    # - XLA fusion and optimization passes
+    # - Model loading before sharding takes effect
+    #
+    # Default to 85% (vLLM uses 90%, we use 85% for safety)
+    0.85
+  end
+end
+
+# Get config for memory calculation
+num_layers_for_mem = String.to_integer(System.get_env("LAYERS", "36"))
+max_seq_for_mem = String.to_integer(System.get_env("MAX_SEQ", "128"))
+batch_for_mem = 1
+tp_size_for_mem = 4
+
+# Calculate memory requirements
+mem_info = MemoryCalculator.calculate(
+  num_layers: num_layers_for_mem,
+  max_seq_len: max_seq_for_mem,
+  batch_size: batch_for_mem,
+  tp_size: tp_size_for_mem
+)
+
+# Allow override via environment variable
+memory_fraction = case System.get_env("MEM_FRAC") do
+  nil ->
+    MemoryCalculator.recommended_memory_fraction(
+      num_layers: num_layers_for_mem,
+      max_seq_len: max_seq_for_mem,
+      batch_size: batch_for_mem,
+      tp_size: tp_size_for_mem
+    )
+  frac_str ->
+    {f, _} = Float.parse(frac_str)
+    f
+end
+
+IO.puts("Memory calculation (per GPU with TP=#{tp_size_for_mem}):")
+IO.puts("  Model weights:")
+IO.puts("    Total params: #{Float.round(mem_info.total_params / 1_000_000, 1)}M (~4B)")
+IO.puts("    Total size: #{Float.round(mem_info.model_gb, 2)} GB")
+IO.puts("    Per GPU (sharded): #{Float.round(mem_info.model_per_gpu_gb, 2)} GB")
+IO.puts("  Runtime buffers:")
+IO.puts("    KV cache: #{Float.round(mem_info.kv_cache_per_gpu_mb, 1)} MB")
+IO.puts("    Attention scores: #{Float.round(mem_info.attention_mb, 1)} MB")
+IO.puts("    FFN activations: #{Float.round(mem_info.ffn_activation_mb, 1)} MB")
+IO.puts("  XLA/CUDA Overhead:")
+IO.puts("    XLA compilation: #{Float.round(mem_info.xla_compile_gb, 1)} GB")
+IO.puts("    XLA temp buffers: #{Float.round(mem_info.xla_temp_gb, 1)} GB")
+IO.puts("    NCCL buffers: #{Float.round(mem_info.nccl_overhead_gb, 1)} GB")
+IO.puts("    CUDA context: #{Float.round(mem_info.cuda_overhead_mb, 0)} MB")
+IO.puts("  Total per GPU (with 30% margin): #{Float.round(mem_info.total_per_gpu_gb, 1)} GB")
+IO.puts("  Memory fraction: #{Float.round(memory_fraction, 2)} (of ~94 GB per H100)")
+
+# Configure EXLA client BEFORE any tensor operations
+Application.put_env(:exla, :clients,
+  cuda: [platform: :cuda, memory_fraction: memory_fraction, preallocate: true]
+)
 
 Nx.default_backend(EXLA.Backend)
 
