@@ -213,7 +213,8 @@ This would give us proper text generation while keeping the proven TP/KV cache i
 | `tp_4gpu_generate.exs` | Basic generation (O(n²)) | ✅ Working |
 | `tp_4gpu_generate_kvcache.exs` | KV cache generation (O(n)) | ✅ Working |
 | `tp_4gpu_generate_proper.exs` | Exponential attention | ✅ Working |
-| **`tp_4gpu_generate_final.exs`** | **PROPER ops (gather, RMSNorm, softmax, causal mask)** | ✅ **BEST** |
+| `tp_4gpu_generate_final.exs` | PROPER ops (gather, RMSNorm, softmax, RoPE) | ✅ Working |
+| **`tp_4gpu_generate_hybrid.exs`** | **Batched prefill + fixed decode cache** | ✅ **LATEST** |
 
 ### Documentation
 | File | Description |
@@ -229,13 +230,16 @@ This would give us proper text generation while keeping the proven TP/KV cache i
 All examples tested on **4x NVIDIA H100 NVL GPUs** with Mistral 7B:
 
 ```bash
-# Run any example:
-LAYERS=2 mix run examples/tp_4gpu_generate_kvcache.exs
+# Hybrid generation (recommended - batched prefill + fixed decode):
+LAYERS=8 MAX_SEQ=128 TOKENS=10 mix run examples/tp_4gpu_generate_hybrid.exs
+
+# Original generation with variable cache (recompiles each token):
+LAYERS=2 mix run examples/tp_4gpu_generate_final.exs
 
 # Quick test (fewer layers):
 LAYERS=2 mix run examples/tp_4gpu_transformer_block.exs
 
-# Full generation demo:
+# Full generation demo (proper ops):
 mix run examples/tp_4gpu_generate_proper.exs
 ```
 
@@ -254,5 +258,22 @@ mix run examples/tp_4gpu_generate_proper.exs
 3. **Multi-GPU Coordination** - NCCL collectives working reliably
 4. **Grouped Query Attention** - Proper GQA support with head replication
 5. **Autoregressive Generation** - 20+ tokens generated successfully
+6. **Hybrid Generation** - Batched prefill + fixed-size decode cache
+
+### Latest: Hybrid Generation (`tp_4gpu_generate_hybrid.exs`)
+
+**Architecture:**
+- **Batched Prefill**: Process all prompt tokens at once (efficient)
+- **Fixed-Size Decode**: Pre-allocated `max_seq_len` cache (no recompilation)
+- Uses `dynamic_update_slice` to update cache at current position
+- Position-based causal masking for attention
+
+**Performance (8 layers, 128 max_seq_len):**
+- Prefill compile: ~4 seconds (one-time per prompt length)
+- Decode compile: ~3.6 seconds (one-time, reused for all tokens)
+- Prefill run: ~18s for 6 tokens
+- Decode: ~13s per token (includes cache transfer overhead)
+
+**Note:** Output quality requires full 32 layers for coherent text.
 
 **This is a fully functional tensor parallel inference system for LLMs in Elixir!** 🚀
