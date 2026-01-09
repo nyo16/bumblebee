@@ -21,6 +21,38 @@
 #   TOP_P     - Nucleus sampling threshold (default: 0.9)
 #   MAX_SEQ   - Pre-allocated cache size (default: 128)
 #   MEM_FRAC  - GPU memory fraction to allocate (default: auto-calculated)
+#   DTYPE     - Data type for model weights: f32, bf16 (default: bf16)
+
+# =============================================================================
+# XLA OPTIMIZATION FLAGS - Must be set BEFORE any EXLA operations
+# =============================================================================
+# These flags enable various XLA optimizations for GPU execution.
+# Set before EXLA client initialization to take effect.
+
+xla_flags = [
+  # Enable cuDNN Flash Attention pattern matching (15-30% speedup at long sequences)
+  "--xla_gpu_enable_cudnn_fmha=true",
+  # Enable Triton-based softmax fusion
+  "--xla_gpu_enable_triton_softmax_fusion=true",
+  # Enable latency hiding scheduler (overlaps compute with communication)
+  "--xla_gpu_enable_latency_hiding_scheduler=true",
+  # Use Triton GEMM for eligible matrix multiplications
+  "--xla_gpu_triton_gemm_any=true",
+  # CUDA Graphs: record and replay GPU operations (reduces kernel launch overhead)
+  # Enabled by default, but we explicitly enable for FUSION and CUSTOM_CALL
+  "--xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUSTOM_CALL,COLLECTIVES",
+  # Minimum operations to capture as CUDA graph
+  "--xla_gpu_graph_min_graph_size=2"
+]
+
+# Merge with any existing XLA_FLAGS
+existing_flags = System.get_env("XLA_FLAGS", "")
+new_flags = Enum.join(xla_flags, " ")
+combined_flags = if existing_flags == "", do: new_flags, else: "#{existing_flags} #{new_flags}"
+System.put_env("XLA_FLAGS", combined_flags)
+
+IO.puts("XLA optimization flags enabled:")
+for flag <- xla_flags, do: IO.puts("  #{flag}")
 
 # =============================================================================
 # MEMORY CALCULATION - Must happen BEFORE EXLA client initialization
@@ -52,13 +84,13 @@ defmodule MemoryCalculator do
   @head_dim 128
   @intermediate_size 9728
   @vocab_size 151_936
-  @bytes_per_param 4  # f32
 
   def calculate(opts \\ []) do
     num_layers = Keyword.get(opts, :num_layers, @num_layers)
     max_seq_len = Keyword.get(opts, :max_seq_len, 128)
     batch_size = Keyword.get(opts, :batch_size, 1)
     tp_size = Keyword.get(opts, :tp_size, 4)
+    bytes_per_param = Keyword.get(opts, :bytes_per_param, 4)  # f32=4, bf16=2
 
     # 1. Model parameters (total, then we'll shard)
     embedding_params = @vocab_size * @hidden_size
@@ -72,26 +104,26 @@ defmodule MemoryCalculator do
       @hidden_size * 2                               # layer norms
 
     total_params = embedding_params + (per_layer_params * num_layers) + @hidden_size
-    model_bytes = total_params * @bytes_per_param
+    model_bytes = total_params * bytes_per_param
     # Embedding is replicated, attention/FFN sharded by TP
-    model_bytes_per_gpu = (embedding_params * @bytes_per_param) +
-                          ((total_params - embedding_params) * @bytes_per_param / tp_size)
+    model_bytes_per_gpu = (embedding_params * bytes_per_param) +
+                          ((total_params - embedding_params) * bytes_per_param / tp_size)
 
     # 2. KV cache per GPU (kv_heads are sharded)
     local_kv_heads = @num_kv_heads / tp_size
     kv_cache_bytes_per_gpu = 2 * batch_size * max_seq_len * num_layers *
-                             local_kv_heads * @head_dim * @bytes_per_param
+                             local_kv_heads * @head_dim * bytes_per_param
 
     # 3. Attention score matrix: batch × local_heads × seq × seq
     local_heads = @num_heads / tp_size
-    attention_scores_bytes = batch_size * local_heads * max_seq_len * max_seq_len * @bytes_per_param
+    attention_scores_bytes = batch_size * local_heads * max_seq_len * max_seq_len * bytes_per_param
 
     # 4. FFN intermediate activations per GPU
     local_intermediate = @intermediate_size / tp_size
-    ffn_activation_bytes = batch_size * max_seq_len * local_intermediate * @bytes_per_param * 2  # gate + up
+    ffn_activation_bytes = batch_size * max_seq_len * local_intermediate * bytes_per_param * 2  # gate + up
 
     # 5. Hidden state activations (replicated per layer)
-    hidden_activation_bytes = batch_size * max_seq_len * @hidden_size * @bytes_per_param
+    hidden_activation_bytes = batch_size * max_seq_len * @hidden_size * bytes_per_param
 
     # Peak activation memory (attention OR FFN, whichever is larger, times some layers in flight)
     peak_activation_bytes = max(attention_scores_bytes, ffn_activation_bytes) +
@@ -155,12 +187,28 @@ max_seq_for_mem = String.to_integer(System.get_env("MAX_SEQ", "128"))
 batch_for_mem = 1
 tp_size_for_mem = 4
 
+# Parse weight dtype - f32 is default for full precision
+# Note: BF16/FP16 can cause numerical instability in softmax/RMSNorm
+# For production, consider mixed precision (BF16 weights, F32 compute)
+dtype_str = System.get_env("DTYPE", "f32")
+{weight_dtype, bytes_per_param} = case dtype_str do
+  "f32" -> {{:f, 32}, 4}
+  "bf16" -> {{:bf, 16}, 2}
+  "f16" -> {{:f, 16}, 2}
+  other -> raise "Unknown DTYPE: #{other}. Supported: f32, bf16, f16"
+end
+# Compute dtype matches weight dtype for now
+# Future: implement mixed precision (BF16 weights + F32 compute)
+dtype = weight_dtype
+IO.puts("Data type: #{dtype_str} (#{bytes_per_param} bytes per param)")
+
 # Calculate memory requirements
 mem_info = MemoryCalculator.calculate(
   num_layers: num_layers_for_mem,
   max_seq_len: max_seq_for_mem,
   batch_size: batch_for_mem,
-  tp_size: tp_size_for_mem
+  tp_size: tp_size_for_mem,
+  bytes_per_param: bytes_per_param
 )
 
 # Allow override via environment variable
@@ -236,6 +284,7 @@ num_layers = String.to_integer(System.get_env("LAYERS", "4"))  # Use fewer layer
 
 IO.puts("\nConfiguration:")
 IO.puts("  TP size: #{tp_size}")
+IO.puts("  Data type: #{dtype_str} #{inspect(dtype)}")
 IO.puts("  Max new tokens: #{max_new_tokens}")
 IO.puts("  Temperature: #{temperature}")
 IO.puts("  Top-k: #{top_k}")
@@ -252,9 +301,14 @@ IO.puts("Step 1: Loading model and tokenizer")
 IO.puts("-" |> String.duplicate(70))
 
 model_id = "Qwen/Qwen3-4B-Instruct-2507"
-IO.puts("  Loading #{model_id}...")
-# Load in f32 (not bf16) to match SPMD typespecs
-{:ok, %{params: params, spec: spec}} = Bumblebee.load_model({:hf, model_id})
+IO.puts("  Loading #{model_id} with dtype=#{dtype_str}...")
+# Load with specified dtype to match SPMD typespecs
+model_type = case weight_dtype do
+  {:f, 32} -> :f32
+  {:bf, 16} -> :bf16
+  {:f, 16} -> :f16
+end
+{:ok, %{params: params, spec: spec}} = Bumblebee.load_model({:hf, model_id}, type: model_type)
 {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model_id})
 
 vocab_size = spec.vocab_size
@@ -459,25 +513,25 @@ IO.puts("  Building prefill SPMD (with proper gather, RMSNorm, softmax, RoPE)...
 # Phase 3: Prefill SPMD with pre-allocated KV cache (outputs max_seq_len sized caches)
 build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
   input_ids_typespec = EXLA.Typespec.tensor({:s, 32}, {batch_size, prompt_len})
-  embed_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
-  norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
+  embed_typespec = EXLA.Typespec.tensor(dtype, {vocab_size, hidden_size})
+  norm_typespec = EXLA.Typespec.tensor(dtype, {hidden_size})
   # For Qwen3: lm_head uses transposed embeddings (tied), shape is {vocab_size, hidden_size}
-  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
+  lm_head_typespec = EXLA.Typespec.tensor(dtype, {vocab_size, hidden_size})
 
   # RoPE embeddings: [prompt_len, head_dim]
-  rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, head_dim})
-  rope_sin_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, head_dim})
+  rope_cos_typespec = EXLA.Typespec.tensor(dtype, {prompt_len, head_dim})
+  rope_sin_typespec = EXLA.Typespec.tensor(dtype, {prompt_len, head_dim})
 
-  q_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_q_size})
-  k_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
-  v_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
-  o_typespec = EXLA.Typespec.tensor({:f, 32}, {local_q_size, hidden_size})
-  gate_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_intermediate})
-  up_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_intermediate})
-  down_typespec = EXLA.Typespec.tensor({:f, 32}, {local_intermediate, hidden_size})
+  q_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_q_size})
+  k_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_kv_size})
+  v_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_kv_size})
+  o_typespec = EXLA.Typespec.tensor(dtype, {local_q_size, hidden_size})
+  gate_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_intermediate})
+  up_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_intermediate})
+  down_typespec = EXLA.Typespec.tensor(dtype, {local_intermediate, hidden_size})
 
   # QK norm weights (Qwen3-specific) - shape {head_dim}
-  qk_norm_typespec = EXLA.Typespec.tensor({:f, 32}, {head_dim})
+  qk_norm_typespec = EXLA.Typespec.tensor(dtype, {head_dim})
 
   layer_param_typespecs = List.duplicate([
     norm_typespec, norm_typespec,
@@ -489,10 +543,10 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
   input_typespecs = [input_ids_typespec, embed_typespec, norm_typespec, lm_head_typespec, rope_cos_typespec, rope_sin_typespec] ++ layer_param_typespecs
 
   # Outputs: logits + K/V caches for each layer (pre-allocated to max_seq_len)
-  output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, vocab_size})
+  output_typespec = EXLA.Typespec.tensor(dtype, {batch_size, vocab_size})
   # Phase 3: Caches are pre-allocated to max_seq_len
-  k_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
-  v_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+  k_cache_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+  v_cache_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
 
   # One K and V cache per layer
   cache_typespecs = List.duplicate([k_cache_typespec, v_cache_typespec], num_layers) |> List.flatten()
@@ -510,7 +564,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
         q: q, k: k, v: v, o: o, gate: gate, up: up, down: down}
     end)
 
-    hidden_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, hidden_size})
+    hidden_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, hidden_size})
 
     # RoPE application function
     # Formula: rotated = x * cos + rotate_half(x) * sin
@@ -521,8 +575,8 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
 
       # Broadcast cos/sin to match x shape
       {batch_local, num_heads_local, seq_len_local, _head_dim_local} = x_typespec.shape
-      cos_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, seq_len_local, head_dim})
-      sin_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, seq_len_local, head_dim})
+      cos_4d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, seq_len_local, head_dim})
+      sin_4d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, seq_len_local, head_dim})
 
       cos_4d = Value.reshape(cos_embed, cos_4d_typespec)
       sin_4d = Value.reshape(sin_embed, sin_4d_typespec)
@@ -533,8 +587,8 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       # Create rotate_half(x)
       # Split x into first half and second half along head_dim
       half_dim = div(head_dim, 2)
-      first_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
-      second_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+      first_half_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, half_dim})
+      second_half_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, half_dim})
 
       # Slice first half: [0:batch, 0:heads, 0:seq, 0:half_dim]
       x_first = Value.slice(x, [0, 0, 0, 0], [batch_local, num_heads_local, seq_len_local, half_dim], [1, 1, 1, 1], first_half_typespec)
@@ -542,7 +596,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       x_second = Value.slice(x, [0, 0, 0, half_dim], [batch_local, num_heads_local, seq_len_local, head_dim], [1, 1, 1, 1], second_half_typespec)
 
       # Negate second half
-      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor({:f, 32}, {}))
+      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor(dtype, {}))
       neg_one_broadcast = Value.broadcast_in_dim(neg_one, [], second_half_typespec)
       x_second_neg = Value.multiply(x_second, neg_one_broadcast, second_half_typespec)
 
@@ -580,8 +634,8 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
 
       # Step 2: Reduce sum over hidden dimension to get sum(x^2)
       # Need to create a reduction region
-      scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
-      reduce_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len})
+      scalar_typespec = EXLA.Typespec.tensor(dtype, {})
+      reduce_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len})
 
       {region, [lhs, rhs]} = Function.push_region(builder, [scalar_typespec, scalar_typespec])
       sum_result = Value.add(lhs, rhs, scalar_typespec)
@@ -608,7 +662,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       rsqrt = Value.rsqrt(mean_squared_eps, reduce_typespec)
 
       # Step 6: Broadcast rsqrt back to full shape
-      rsqrt_3d_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, 1})
+      rsqrt_3d_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, 1})
       rsqrt_3d = Value.reshape(rsqrt, rsqrt_3d_typespec)
       rsqrt_broadcast = Value.broadcast_in_dim(rsqrt_3d, [0, 1, 2], typespec)
 
@@ -628,9 +682,9 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       {_batch_size, _local_kv_heads, _kv_head_repeat, _query_len, _key_len} = scores_typespec.shape
 
       # Step 1: Find max along seq_dim
-      scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
+      scalar_typespec = EXLA.Typespec.tensor(dtype, {})
       reduce_shape = Tuple.delete_at(scores_typespec.shape, seq_dim)
-      reduce_typespec = EXLA.Typespec.tensor({:f, 32}, reduce_shape)
+      reduce_typespec = EXLA.Typespec.tensor(dtype, reduce_shape)
 
       {region, [lhs, rhs]} = Function.push_region(builder, [scalar_typespec, scalar_typespec])
       max_result = Value.max(lhs, rhs, scalar_typespec)
@@ -644,7 +698,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       [max_scores] = Value.reduce(region, [neg_inf], [scores], [seq_dim], [reduce_typespec])
 
       # Step 2: Broadcast max back to original shape
-      max_expanded_typespec = EXLA.Typespec.tensor({:f, 32}, Tuple.insert_at(reduce_shape, seq_dim, 1))
+      max_expanded_typespec = EXLA.Typespec.tensor(dtype, Tuple.insert_at(reduce_shape, seq_dim, 1))
       max_expanded = Value.reshape(max_scores, max_expanded_typespec)
       max_broadcast = Value.broadcast_in_dim(max_expanded, [0, 1, 2, 3, 4], scores_typespec)
 
@@ -676,23 +730,23 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       # Self-attention with cache output
       normed_for_attn = rms_norm.(hidden, weights.sa_norm, hidden_typespec)
 
-      q_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_q_size})
-      k_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_kv_size})
-      v_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_kv_size})
+      q_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_q_size})
+      k_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_kv_size})
+      v_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_kv_size})
 
       q = Value.dot_general(normed_for_attn, weights.q, {[2], [], [0], []}, :default, q_proj_typespec)
       k = Value.dot_general(normed_for_attn, weights.k, {[2], [], [0], []}, :default, k_proj_typespec)
       v = Value.dot_general(normed_for_attn, weights.v, {[2], [], [0], []}, :default, v_proj_typespec)
 
       # Reshape for multi-head attention
-      q_reshaped = Value.reshape(q, EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_heads, head_dim}))
-      k_reshaped = Value.reshape(k, EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_kv_heads, head_dim}))
-      v_reshaped = Value.reshape(v, EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_kv_heads, head_dim}))
+      q_reshaped = Value.reshape(q, EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_heads, head_dim}))
+      k_reshaped = Value.reshape(k, EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_kv_heads, head_dim}))
+      v_reshaped = Value.reshape(v, EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_kv_heads, head_dim}))
 
       # Transpose to [batch, heads, seq_len, head_dim]
-      q_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, prompt_len, head_dim})
-      k_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim})
-      v_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, prompt_len, head_dim})
+      q_transposed_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_heads, prompt_len, head_dim})
+      k_transposed_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, prompt_len, head_dim})
+      v_transposed_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, prompt_len, head_dim})
 
       q_transposed_raw = Value.transpose(q_reshaped, [0, 2, 1, 3], q_transposed_typespec)
       k_transposed_raw = Value.transpose(k_reshaped, [0, 2, 1, 3], k_transposed_typespec)
@@ -709,8 +763,8 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
         x_squared = Value.multiply(x, x, typespec)
 
         # Reduce over head_dim to get mean(x^2)
-        scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
-        reduce_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local})
+        scalar_typespec = EXLA.Typespec.tensor(dtype, {})
+        reduce_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local})
 
         {region, [lhs, rhs]} = Function.push_region(builder, [scalar_typespec, scalar_typespec])
         sum_result = Value.add(lhs, rhs, scalar_typespec)
@@ -734,7 +788,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
         rsqrt = Value.rsqrt(mean_squared_eps, reduce_typespec)
 
         # Broadcast rsqrt back to 4D
-        rsqrt_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, 1})
+        rsqrt_4d_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, 1})
         rsqrt_4d = Value.reshape(rsqrt, rsqrt_4d_typespec)
         rsqrt_broadcast = Value.broadcast_in_dim(rsqrt_4d, [0, 1, 2, 3], typespec)
 
@@ -761,11 +815,11 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       # Phase 3: Create pre-allocated caches and use dynamic_update_slice
       # K and V have shape {batch, local_kv_heads, prompt_len, head_dim}
       # We need to write them into caches of shape {batch, local_kv_heads, max_seq_len_local, head_dim}
-      k_cache_full_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
-      v_cache_full_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+      k_cache_full_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+      v_cache_full_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
 
       # Initialize full caches with zeros
-      zero_scalar = Value.constant(builder, [0.0], EXLA.Typespec.tensor({:f, 32}, {}))
+      zero_scalar = Value.constant(builder, [0.0], EXLA.Typespec.tensor(dtype, {}))
       k_cache_zeros = Value.broadcast_in_dim(zero_scalar, [], k_cache_full_typespec)
       v_cache_zeros = Value.broadcast_in_dim(zero_scalar, [], v_cache_full_typespec)
 
@@ -776,20 +830,20 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       v_cache = Value.dynamic_update_slice(v_cache_zeros, v_transposed, [zero_idx, zero_idx, zero_idx, zero_idx], v_cache_full_typespec)
 
       # Grouped query attention
-      k_for_attn = Value.transpose(k_transposed, [0, 1, 3, 2], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, head_dim, prompt_len}))
+      k_for_attn = Value.transpose(k_transposed, [0, 1, 3, 2], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, head_dim, prompt_len}))
 
-      q_grouped = Value.reshape(q_transposed, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim}))
-      k_expanded = Value.reshape(k_for_attn, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim, prompt_len}))
-      v_expanded = Value.reshape(v_transposed, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, prompt_len, head_dim}))
+      q_grouped = Value.reshape(q_transposed, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim}))
+      k_expanded = Value.reshape(k_for_attn, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, head_dim, prompt_len}))
+      v_expanded = Value.reshape(v_transposed, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, prompt_len, head_dim}))
 
-      k_broadcast = Value.broadcast_in_dim(k_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, head_dim, prompt_len}))
-      v_broadcast = Value.broadcast_in_dim(v_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim}))
+      k_broadcast = Value.broadcast_in_dim(k_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, head_dim, prompt_len}))
+      v_broadcast = Value.broadcast_in_dim(v_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim}))
 
-      scores_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, prompt_len})
+      scores_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, prompt_len})
       scores = Value.dot_general(q_grouped, k_broadcast, {[4], [0, 1, 2], [3], [0, 1, 2]}, :default, scores_typespec)
 
       scale_value = 1.0 / :math.sqrt(head_dim)
-      scale_typespec = EXLA.Typespec.tensor({:f, 32}, {})
+      scale_typespec = EXLA.Typespec.tensor(dtype, {})
       scale_tensor = Value.constant(builder, [scale_value], scale_typespec)
       scale_broadcast = Value.broadcast_in_dim(scale_tensor, [], scores_typespec)
       scores_scaled = Value.multiply(scores, scale_broadcast, scores_typespec)
@@ -813,7 +867,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       neg_inf_scalar = Value.constant(builder, [-1.0e9], scale_typespec)
       zero_scalar = Value.constant(builder, [0.0], scale_typespec)
 
-      mask_float_typespec = EXLA.Typespec.tensor({:f, 32}, {prompt_len, prompt_len})
+      mask_float_typespec = EXLA.Typespec.tensor(dtype, {prompt_len, prompt_len})
       neg_inf_mask = Value.broadcast_in_dim(neg_inf_scalar, [], mask_float_typespec)
       zero_mask = Value.broadcast_in_dim(zero_scalar, [], mask_float_typespec)
 
@@ -821,7 +875,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       causal_mask_2d = Value.select(causal_mask_int, zero_mask, neg_inf_mask, mask_float_typespec)
 
       # Broadcast mask to full attention shape [batch, heads, kv_repeat, prompt_len, prompt_len]
-      mask_5d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, prompt_len, prompt_len})
+      mask_5d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, 1, prompt_len, prompt_len})
       causal_mask_5d = Value.reshape(causal_mask_2d, mask_5d_typespec)
       causal_mask_broadcast = Value.broadcast_in_dim(causal_mask_5d, [0, 1, 2, 3, 4], scores_typespec)
 
@@ -831,12 +885,12 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       # Apply PROPER softmax
       attention_weights = softmax.(scores_masked, scores_typespec, 4)
 
-      attn_output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim})
+      attn_output_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, prompt_len, head_dim})
       attn_output = Value.dot_general(attention_weights, v_broadcast, {[4], [0, 1, 2], [3], [0, 1, 2]}, :default, attn_output_typespec)
 
-      attn_merged = Value.reshape(attn_output, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, prompt_len, head_dim}))
-      attn_transposed = Value.transpose(attn_merged, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_heads, head_dim}))
-      attn_flat = Value.reshape(attn_transposed, EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_q_size}))
+      attn_merged = Value.reshape(attn_output, EXLA.Typespec.tensor(dtype, {batch_size, local_heads, prompt_len, head_dim}))
+      attn_transposed = Value.transpose(attn_merged, [0, 2, 1, 3], EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_heads, head_dim}))
+      attn_flat = Value.reshape(attn_transposed, EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_q_size}))
 
       attn_partial = Value.dot_general(attn_flat, weights.o, {[2], [], [0], []}, :default, hidden_typespec)
       attn_result = Value.all_reduce(attn_partial, :sum, replica_groups, hidden_typespec)
@@ -846,7 +900,7 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
       # FFN
       normed_for_ffn = rms_norm.(after_attn, weights.ffn_norm, hidden_typespec)
 
-      intermediate_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, prompt_len, local_intermediate})
+      intermediate_typespec = EXLA.Typespec.tensor(dtype, {batch_size, prompt_len, local_intermediate})
 
       gate_out = Value.dot_general(normed_for_ffn, weights.gate, {[2], [], [0], []}, :default, intermediate_typespec)
       up_out = Value.dot_general(normed_for_ffn, weights.up, {[2], [], [0], []}, :default, intermediate_typespec)
@@ -867,9 +921,9 @@ build_prefill_spmd = fn batch_size, prompt_len, max_seq_len_local ->
     # Final norm + LM head (last position only)
     normed_output = rms_norm.(final_hidden, final_norm_w, hidden_typespec)
 
-    last_hidden_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, hidden_size})
+    last_hidden_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, hidden_size})
     last_hidden = Value.slice(normed_output, [0, prompt_len - 1, 0], [batch_size, prompt_len, hidden_size], [1, 1, 1], last_hidden_typespec)
-    last_hidden_2d = Value.reshape(last_hidden, EXLA.Typespec.tensor({:f, 32}, {batch_size, hidden_size}))
+    last_hidden_2d = Value.reshape(last_hidden, EXLA.Typespec.tensor(dtype, {batch_size, hidden_size}))
 
     # lm_head_w is {vocab, hidden}, contract hidden dims: axis 1 of hidden with axis 1 of lm_head
     logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [1], []}, :default, output_typespec)
@@ -888,25 +942,25 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
   # Input: single token + position
   input_ids_typespec = EXLA.Typespec.tensor({:s, 32}, {batch_size, 1})
   position_typespec = EXLA.Typespec.tensor({:s, 32}, {})  # Scalar position
-  embed_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
-  norm_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size})
+  embed_typespec = EXLA.Typespec.tensor(dtype, {vocab_size, hidden_size})
+  norm_typespec = EXLA.Typespec.tensor(dtype, {hidden_size})
   # For Qwen3: lm_head uses transposed embeddings (tied), shape is {vocab_size, hidden_size}
-  lm_head_typespec = EXLA.Typespec.tensor({:f, 32}, {vocab_size, hidden_size})
+  lm_head_typespec = EXLA.Typespec.tensor(dtype, {vocab_size, hidden_size})
 
   # RoPE embeddings for the single new position: [1, head_dim]
-  rope_cos_typespec = EXLA.Typespec.tensor({:f, 32}, {1, head_dim})
-  rope_sin_typespec = EXLA.Typespec.tensor({:f, 32}, {1, head_dim})
+  rope_cos_typespec = EXLA.Typespec.tensor(dtype, {1, head_dim})
+  rope_sin_typespec = EXLA.Typespec.tensor(dtype, {1, head_dim})
 
-  q_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_q_size})
-  k_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
-  v_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_kv_size})
-  o_typespec = EXLA.Typespec.tensor({:f, 32}, {local_q_size, hidden_size})
-  gate_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_intermediate})
-  up_typespec = EXLA.Typespec.tensor({:f, 32}, {hidden_size, local_intermediate})
-  down_typespec = EXLA.Typespec.tensor({:f, 32}, {local_intermediate, hidden_size})
+  q_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_q_size})
+  k_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_kv_size})
+  v_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_kv_size})
+  o_typespec = EXLA.Typespec.tensor(dtype, {local_q_size, hidden_size})
+  gate_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_intermediate})
+  up_typespec = EXLA.Typespec.tensor(dtype, {hidden_size, local_intermediate})
+  down_typespec = EXLA.Typespec.tensor(dtype, {local_intermediate, hidden_size})
 
   # QK norm weights (Qwen3-specific) - shape {head_dim}
-  qk_norm_typespec = EXLA.Typespec.tensor({:f, 32}, {head_dim})
+  qk_norm_typespec = EXLA.Typespec.tensor(dtype, {head_dim})
 
   layer_param_typespecs = List.duplicate([
     norm_typespec, norm_typespec,
@@ -916,15 +970,15 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
   ], num_layers) |> List.flatten()
 
   # Phase 3: Fixed-size K/V caches (same shape for input and output)
-  k_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
-  v_cache_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+  k_cache_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
+  v_cache_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, max_seq_len_local, head_dim})
   cache_typespecs = List.duplicate([k_cache_typespec, v_cache_typespec], num_layers) |> List.flatten()
 
   # Add position input after rope embeddings
   input_typespecs = [input_ids_typespec, position_typespec, embed_typespec, norm_typespec, lm_head_typespec, rope_cos_typespec, rope_sin_typespec] ++ layer_param_typespecs ++ cache_typespecs
 
   # Outputs: logits + updated K/V caches (same fixed shape)
-  output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, vocab_size})
+  output_typespec = EXLA.Typespec.tensor(dtype, {batch_size, vocab_size})
   output_typespecs = [output_typespec] ++ cache_typespecs
 
   replica_groups = [Enum.to_list(0..(tp_size - 1))]
@@ -953,7 +1007,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       {weights, k_cache_in, v_cache_in}
     end)
 
-    hidden_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, hidden_size})
+    hidden_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, hidden_size})
 
     # RoPE application function for decode (single position)
     apply_rope_decode = fn x, cos_embed, sin_embed, x_typespec ->
@@ -961,8 +1015,8 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       # cos/sin shape: [1, head_dim]
 
       {batch_local, num_heads_local, seq_len_local, _head_dim_local} = x_typespec.shape
-      cos_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, head_dim})
-      sin_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, head_dim})
+      cos_4d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, 1, head_dim})
+      sin_4d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, 1, head_dim})
 
       cos_4d = Value.reshape(cos_embed, cos_4d_typespec)
       sin_4d = Value.reshape(sin_embed, sin_4d_typespec)
@@ -972,15 +1026,15 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
       # Create rotate_half(x)
       half_dim = div(head_dim, 2)
-      first_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
-      second_half_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, half_dim})
+      first_half_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, half_dim})
+      second_half_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, half_dim})
 
       # Slice first half: [0:batch, 0:heads, 0:seq, 0:half_dim]
       x_first = Value.slice(x, [0, 0, 0, 0], [batch_local, num_heads_local, seq_len_local, half_dim], [1, 1, 1, 1], first_half_typespec)
       # Slice second half: [0:batch, 0:heads, 0:seq, half_dim:head_dim]
       x_second = Value.slice(x, [0, 0, 0, half_dim], [batch_local, num_heads_local, seq_len_local, head_dim], [1, 1, 1, 1], second_half_typespec)
 
-      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor({:f, 32}, {}))
+      neg_one = Value.constant(builder, [-1.0], EXLA.Typespec.tensor(dtype, {}))
       neg_one_broadcast = Value.broadcast_in_dim(neg_one, [], second_half_typespec)
       x_second_neg = Value.multiply(x_second, neg_one_broadcast, second_half_typespec)
 
@@ -1005,8 +1059,8 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
     # PROPER RMSNorm implementation (for decode, seq_len=1)
     rms_norm = fn x, weight, typespec ->
-      scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
-      reduce_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1})
+      scalar_typespec = EXLA.Typespec.tensor(dtype, {})
+      reduce_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1})
 
       x_squared = Value.multiply(x, x, typespec)
 
@@ -1028,7 +1082,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
       rsqrt = Value.rsqrt(mean_squared_eps, reduce_typespec)
 
-      rsqrt_3d_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, 1})
+      rsqrt_3d_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, 1})
       rsqrt_3d = Value.reshape(rsqrt, rsqrt_3d_typespec)
       rsqrt_broadcast = Value.broadcast_in_dim(rsqrt_3d, [0, 1, 2], typespec)
 
@@ -1041,21 +1095,21 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
     {final_hidden, updated_caches} = Enum.reduce(layer_weights_and_caches, {hidden_states, []}, fn {weights, k_cache_in, v_cache_in}, {hidden, acc_caches} ->
       normed_for_attn = rms_norm.(hidden, weights.sa_norm, hidden_typespec)
 
-      q_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_q_size})
-      k_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_size})
-      v_proj_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_size})
+      q_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, local_q_size})
+      k_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, local_kv_size})
+      v_proj_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, local_kv_size})
 
       q = Value.dot_general(normed_for_attn, weights.q, {[2], [], [0], []}, :default, q_proj_typespec)
       k_new = Value.dot_general(normed_for_attn, weights.k, {[2], [], [0], []}, :default, k_proj_typespec)
       v_new = Value.dot_general(normed_for_attn, weights.v, {[2], [], [0], []}, :default, v_proj_typespec)
 
       # Reshape new K/V
-      k_new_reshaped = Value.reshape(k_new, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_heads, head_dim}))
-      v_new_reshaped = Value.reshape(v_new, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_kv_heads, head_dim}))
+      k_new_reshaped = Value.reshape(k_new, EXLA.Typespec.tensor(dtype, {batch_size, 1, local_kv_heads, head_dim}))
+      v_new_reshaped = Value.reshape(v_new, EXLA.Typespec.tensor(dtype, {batch_size, 1, local_kv_heads, head_dim}))
 
-      k_new_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim})
+      k_new_transposed_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, head_dim})
       k_new_transposed_raw = Value.transpose(k_new_reshaped, [0, 2, 1, 3], k_new_transposed_typespec)
-      v_new_transposed = Value.transpose(v_new_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim}))
+      v_new_transposed = Value.transpose(v_new_reshaped, [0, 2, 1, 3], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, head_dim}))
 
       # QK Norm (Qwen3-specific): RMSNorm on Q and K per head before RoPE
       qk_rms_norm_decode = fn x, weight, typespec ->
@@ -1063,8 +1117,8 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
         x_squared = Value.multiply(x, x, typespec)
 
-        scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
-        reduce_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local})
+        scalar_typespec = EXLA.Typespec.tensor(dtype, {})
+        reduce_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local})
 
         {region, [lhs, rhs]} = Function.push_region(builder, [scalar_typespec, scalar_typespec])
         sum_result = Value.add(lhs, rhs, scalar_typespec)
@@ -1084,7 +1138,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
         rsqrt = Value.rsqrt(mean_squared_eps, reduce_typespec)
 
-        rsqrt_4d_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_local, num_heads_local, seq_len_local, 1})
+        rsqrt_4d_typespec = EXLA.Typespec.tensor(dtype, {batch_local, num_heads_local, seq_len_local, 1})
         rsqrt_4d = Value.reshape(rsqrt, rsqrt_4d_typespec)
         rsqrt_broadcast = Value.broadcast_in_dim(rsqrt_4d, [0, 1, 2, 3], typespec)
 
@@ -1110,8 +1164,8 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       v_cache_updated = Value.dynamic_update_slice(v_cache_in, v_new_transposed, [zero_idx, zero_idx, position, zero_idx], v_cache_typespec)
 
       # Reshape Q and apply RoPE (conditionally)
-      q_reshaped = Value.reshape(q, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_heads, head_dim}))
-      q_transposed_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, 1, head_dim})
+      q_reshaped = Value.reshape(q, EXLA.Typespec.tensor(dtype, {batch_size, 1, local_heads, head_dim}))
+      q_transposed_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_heads, 1, head_dim})
       q_transposed_raw = Value.transpose(q_reshaped, [0, 2, 1, 3], q_transposed_typespec)
 
       # Apply QK norm to Q (Qwen3-specific)
@@ -1124,20 +1178,20 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       end
 
       # Grouped query attention using full cache (attention mask will handle valid positions)
-      k_for_attn = Value.transpose(k_cache_updated, [0, 1, 3, 2], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, head_dim, max_seq_len_local}))
+      k_for_attn = Value.transpose(k_cache_updated, [0, 1, 3, 2], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, head_dim, max_seq_len_local}))
 
-      q_grouped = Value.reshape(q_transposed, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1, head_dim}))
-      k_expanded = Value.reshape(k_for_attn, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, head_dim, max_seq_len_local}))
-      v_expanded = Value.reshape(v_cache_updated, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, 1, max_seq_len_local, head_dim}))
+      q_grouped = Value.reshape(q_transposed, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1, head_dim}))
+      k_expanded = Value.reshape(k_for_attn, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, head_dim, max_seq_len_local}))
+      v_expanded = Value.reshape(v_cache_updated, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, 1, max_seq_len_local, head_dim}))
 
-      k_broadcast = Value.broadcast_in_dim(k_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, head_dim, max_seq_len_local}))
-      v_broadcast = Value.broadcast_in_dim(v_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, max_seq_len_local, head_dim}))
+      k_broadcast = Value.broadcast_in_dim(k_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, head_dim, max_seq_len_local}))
+      v_broadcast = Value.broadcast_in_dim(v_expanded, [0, 1, 2, 3, 4], EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, max_seq_len_local, head_dim}))
 
-      scores_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1, max_seq_len_local})
+      scores_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1, max_seq_len_local})
       scores = Value.dot_general(q_grouped, k_broadcast, {[4], [0, 1, 2], [3], [0, 1, 2]}, :default, scores_typespec)
 
       scale_value = 1.0 / :math.sqrt(head_dim)
-      scale_typespec = EXLA.Typespec.tensor({:f, 32}, {})
+      scale_typespec = EXLA.Typespec.tensor(dtype, {})
       scale_tensor = Value.constant(builder, [scale_value], scale_typespec)
       scale_broadcast = Value.broadcast_in_dim(scale_tensor, [], scores_typespec)
       scores_scaled = Value.multiply(scores, scale_broadcast, scores_typespec)
@@ -1157,13 +1211,13 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       # Convert to float mask
       neg_inf_scalar = Value.constant(builder, [-1.0e9], scale_typespec)
       zero_scalar = Value.constant(builder, [0.0], scale_typespec)
-      mask_1d_typespec = EXLA.Typespec.tensor({:f, 32}, {max_seq_len_local})
+      mask_1d_typespec = EXLA.Typespec.tensor(dtype, {max_seq_len_local})
       neg_inf_1d = Value.broadcast_in_dim(neg_inf_scalar, [], mask_1d_typespec)
       zero_1d = Value.broadcast_in_dim(zero_scalar, [], mask_1d_typespec)
       mask_1d = Value.select(valid_mask, zero_1d, neg_inf_1d, mask_1d_typespec)
 
       # Broadcast mask to full attention shape
-      mask_5d_typespec = EXLA.Typespec.tensor({:f, 32}, {1, 1, 1, 1, max_seq_len_local})
+      mask_5d_typespec = EXLA.Typespec.tensor(dtype, {1, 1, 1, 1, max_seq_len_local})
       mask_5d = Value.reshape(mask_1d, mask_5d_typespec)
       mask_broadcast = Value.broadcast_in_dim(mask_5d, [0, 1, 2, 3, 4], scores_typespec)
 
@@ -1171,8 +1225,8 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       scores_masked = Value.add(scores_scaled, mask_broadcast, scores_typespec)
 
       # PROPER SOFTMAX for decode phase
-      scalar_typespec = EXLA.Typespec.tensor({:f, 32}, {})
-      reduce_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1})
+      scalar_typespec = EXLA.Typespec.tensor(dtype, {})
+      reduce_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1})
 
       {region, [lhs, rhs]} = Function.push_region(builder, [scalar_typespec, scalar_typespec])
       max_result = Value.max(lhs, rhs, scalar_typespec)
@@ -1182,7 +1236,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       neg_inf = Value.constant(builder, [-1.0e9], scalar_typespec)
       [max_scores] = Value.reduce(region, [neg_inf], [scores_masked], [4], [reduce_typespec])
 
-      max_expanded = Value.reshape(max_scores, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1, 1}))
+      max_expanded = Value.reshape(max_scores, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1, 1}))
       max_broadcast = Value.broadcast_in_dim(max_expanded, [0, 1, 2, 3, 4], scores_typespec)
       scores_shifted = Value.subtract(scores_masked, max_broadcast, scores_typespec)
       scores_exp = Value.exp(scores_shifted, scores_typespec)
@@ -1195,16 +1249,16 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       zero = Value.constant(builder, [0.0], scalar_typespec)
       [sum_exp] = Value.reduce(region, [zero], [scores_exp], [4], [reduce_typespec])
 
-      sum_expanded = Value.reshape(sum_exp, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1, 1}))
+      sum_expanded = Value.reshape(sum_exp, EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1, 1}))
       sum_broadcast = Value.broadcast_in_dim(sum_expanded, [0, 1, 2, 3, 4], scores_typespec)
       attention_weights = Value.divide(scores_exp, sum_broadcast, scores_typespec)
 
-      attn_output_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, local_kv_heads, kv_head_repeat, 1, head_dim})
+      attn_output_typespec = EXLA.Typespec.tensor(dtype, {batch_size, local_kv_heads, kv_head_repeat, 1, head_dim})
       attn_output = Value.dot_general(attention_weights, v_broadcast, {[4], [0, 1, 2], [3], [0, 1, 2]}, :default, attn_output_typespec)
 
-      attn_merged = Value.reshape(attn_output, EXLA.Typespec.tensor({:f, 32}, {batch_size, local_heads, 1, head_dim}))
-      attn_transposed = Value.transpose(attn_merged, [0, 2, 1, 3], EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_heads, head_dim}))
-      attn_flat = Value.reshape(attn_transposed, EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_q_size}))
+      attn_merged = Value.reshape(attn_output, EXLA.Typespec.tensor(dtype, {batch_size, local_heads, 1, head_dim}))
+      attn_transposed = Value.transpose(attn_merged, [0, 2, 1, 3], EXLA.Typespec.tensor(dtype, {batch_size, 1, local_heads, head_dim}))
+      attn_flat = Value.reshape(attn_transposed, EXLA.Typespec.tensor(dtype, {batch_size, 1, local_q_size}))
 
       attn_partial = Value.dot_general(attn_flat, weights.o, {[2], [], [0], []}, :default, hidden_typespec)
       attn_result = Value.all_reduce(attn_partial, :sum, replica_groups, hidden_typespec)
@@ -1214,7 +1268,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
       # FFN
       normed_for_ffn = rms_norm.(after_attn, weights.ffn_norm, hidden_typespec)
 
-      intermediate_typespec = EXLA.Typespec.tensor({:f, 32}, {batch_size, 1, local_intermediate})
+      intermediate_typespec = EXLA.Typespec.tensor(dtype, {batch_size, 1, local_intermediate})
 
       gate_out = Value.dot_general(normed_for_ffn, weights.gate, {[2], [], [0], []}, :default, intermediate_typespec)
       up_out = Value.dot_general(normed_for_ffn, weights.up, {[2], [], [0], []}, :default, intermediate_typespec)
@@ -1233,7 +1287,7 @@ build_decode_spmd_fixed = fn batch_size, max_seq_len_local ->
 
     # Final norm + LM head
     normed_output = rms_norm.(final_hidden, final_norm_w, hidden_typespec)
-    last_hidden_2d = Value.reshape(normed_output, EXLA.Typespec.tensor({:f, 32}, {batch_size, hidden_size}))
+    last_hidden_2d = Value.reshape(normed_output, EXLA.Typespec.tensor(dtype, {batch_size, hidden_size}))
     # lm_head_w is {vocab, hidden}, contract hidden dims: axis 1 of hidden with axis 1 of lm_head
     logits = Value.dot_general(last_hidden_2d, lm_head_w, {[1], [], [1], []}, :default, output_typespec)
 
