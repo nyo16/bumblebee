@@ -111,35 +111,37 @@ predicted_ids = Nx.argmax(logits, axis: -1)
 Bumblebee.Tokenizer.decode(tokenizer, predicted_ids)
 ```
 
-## Using the Generation Serving (Recommended)
+## Generating in One Call
 
-For better text generation with proper sampling, use the generation serving:
+`Bumblebee.Multimodal.ImageTextToText.generate/6` is a single-call
+helper that featurizes the image, expands the `<|image_pad|>` marker
+in your prompt to the right number of visual tokens, and runs
+generation:
 
 ```elixir
-serving =
-  Bumblebee.Text.generation(model_info, tokenizer,
-    max_new_tokens: 256,
-    compile: [batch_size: 1, sequence_length: 2048]
-  )
+{:ok, generation_config} = Bumblebee.load_generation_config({:hf, repo})
+generation_config = Bumblebee.configure(generation_config, max_new_tokens: 64)
 
-# Create the prompt with image placeholder
 prompt = "<|im_start|>user
-<|vision_start|><|image_pad|><|vision_end|>What do you see in this image? Describe it in detail.<|im_end|>
+<|vision_start|><|image_pad|><|vision_end|>What is in this image?<|im_end|>
 <|im_start|>assistant
 "
 
-# Process image
-image_inputs = Bumblebee.apply_featurizer(featurizer, image)
-
-# Combine prompt with image inputs
-generation_input = %{
-  prompt: prompt,
-  images: image_inputs
-}
-
-# Generate
-Nx.Serving.run(serving, generation_input)
+Bumblebee.Multimodal.ImageTextToText.generate(
+  model_info,
+  featurizer,
+  tokenizer,
+  generation_config,
+  prompt,
+  image
+)
+#=> %{text: "A group of cats lying on a pink blanket with remote controls.", token_ids: ...}
 ```
+
+> Note: this is a single-call helper — each call recompiles the
+> generation graph if the image size or sequence length changes. The
+> follow-up static-shape padding work lets one compiled graph serve
+> repeated calls with varying image sizes.
 
 ## Multiple Images in One Prompt
 
