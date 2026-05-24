@@ -138,10 +138,41 @@ Bumblebee.Multimodal.ImageTextToText.generate(
 #=> %{text: "A group of cats lying on a pink blanket with remote controls.", token_ids: ...}
 ```
 
-> Note: this is a single-call helper — each call recompiles the
-> generation graph if the image size or sequence length changes. The
-> follow-up static-shape padding work lets one compiled graph serve
-> repeated calls with varying image sizes.
+> Note: each `generate/6` call recompiles the generation graph when
+> the image size or sequence length changes. For repeated calls, use
+> `compile/5` + `run/3` (see below).
+
+## Compile Once, Run Many
+
+For serving-style use where many images of varying sizes share one
+compiled graph, configure upper bounds with `compile/5`, then call
+`run/3` repeatedly. The featurizer pads `pixel_values` and
+`image_grid_thw` to the maxima you set, and the vision encoder
+excludes the padded patches from attention.
+
+```elixir
+compiled =
+  Bumblebee.Multimodal.ImageTextToText.compile(
+    model_info,
+    featurizer,
+    tokenizer,
+    generation_config,
+    max_patches: 1024,
+    max_num_images: 1,
+    sequence_length: 384
+  )
+
+# First call: JIT-compiles for these upper-bound shapes
+Bumblebee.Multimodal.ImageTextToText.run(compiled, prompt, image)
+
+# Subsequent calls reuse the same compiled graph, even if the new
+# image produces fewer real patches — padding makes the shapes match.
+Bumblebee.Multimodal.ImageTextToText.run(compiled, prompt, another_image)
+```
+
+On `Qwen3-VL-2B-Instruct` + CPU + a 640×480 COCO image, the warm
+call runs in ~10s while the cold (JIT-compiling) call takes ~27s — a
+2.7x speedup that scales with the number of repeated calls.
 
 ## Multiple Images in One Prompt
 

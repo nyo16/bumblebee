@@ -250,7 +250,7 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     src_grid_size = trunc(:math.sqrt(spec.num_position_embeddings))
     merge_size = spec.spatial_merge_size
 
-    {row_in_image, col_in_image, grid_h_per_patch, grid_w_per_patch, _image_id} =
+    {row_in_image, col_in_image, grid_h_per_patch, grid_w_per_patch, _image_id, _patch_valid} =
       patch_metadata(grid_thw, total_patches, merge_size)
 
     src_max_f = Nx.tensor(src_grid_size - 1, type: :f32)
@@ -317,15 +317,27 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
 
     cumulative = Nx.cumulative_sum(patches_per_image)
     exclusive_cumulative = Nx.subtract(cumulative, patches_per_image)
+    total_real_patches = Nx.sum(patches_per_image)
 
     patch_indices = Nx.iota({total_patches}, type: :s64)
 
-    image_id_per_patch =
+    # Patches beyond total_real_patches are padding slots (when the
+    # featurizer was configured with :max_patches). Mark them invalid so
+    # downstream attention masking can exclude them entirely.
+    patch_valid = Nx.less(patch_indices, total_real_patches)
+
+    image_id_raw =
       patch_indices
       |> Nx.new_axis(-1)
       |> Nx.greater_equal(Nx.new_axis(cumulative, 0))
       |> Nx.sum(axes: [-1])
       |> Nx.as_type(:s64)
+
+    n_images = Nx.axis_size(grid_thw, 0)
+    # Padded patches map to image_id == n_images (out of bounds). Clip so
+    # gather operations succeed. Their derived row/col/grid values are
+    # garbage but get masked out via `patch_valid` in the attention step.
+    image_id_per_patch = Nx.clip(image_id_raw, 0, n_images - 1)
 
     offset_per_patch = Nx.take(exclusive_cumulative, image_id_per_patch)
     local_index = Nx.subtract(patch_indices, offset_per_patch)
@@ -333,8 +345,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     grid_h_per_patch = Nx.take(grid_h, image_id_per_patch)
     grid_w_per_patch = Nx.take(grid_w, image_id_per_patch)
 
+    # Padded images have grid_w == 0; guard the divisions so we don't
+    # divide by zero. The resulting coordinates for padded patches are
+    # arbitrary and are masked out downstream.
+    safe_grid_w = Nx.max(grid_w_per_patch, merge_size)
+
     merge_sq = merge_size * merge_size
-    merged_w_per_patch = Nx.quotient(grid_w_per_patch, merge_size)
+    merged_w_per_patch = Nx.quotient(safe_grid_w, merge_size)
 
     block_idx = Nx.quotient(local_index, merge_sq)
     within = Nx.remainder(local_index, merge_sq)
@@ -346,7 +363,8 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     row_in_image = block_row |> Nx.multiply(merge_size) |> Nx.add(within_h)
     col_in_image = block_col |> Nx.multiply(merge_size) |> Nx.add(within_w)
 
-    {row_in_image, col_in_image, grid_h_per_patch, grid_w_per_patch, image_id_per_patch}
+    {row_in_image, col_in_image, grid_h_per_patch, grid_w_per_patch, image_id_per_patch,
+     patch_valid}
   end
 
   defp encoder(embeddings, grid_thw, spec, opts) do
@@ -365,7 +383,7 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         fn embed, grid_thw_t, _opts ->
           {_batch, total_patches, _hidden} = Nx.shape(embed)
 
-          {row_in_image, col_in_image, _, _, _} =
+          {row_in_image, col_in_image, _, _, _, _} =
             patch_metadata(grid_thw_t, total_patches, spec.spatial_merge_size)
 
           compute_2d_rotary_from_positions(
@@ -384,10 +402,10 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         fn embed, grid_thw_t, _opts ->
           {_batch, total_patches, _hidden} = Nx.shape(embed)
 
-          {_, _, _, _, image_id_per_patch} =
+          {_, _, _, _, image_id_per_patch, patch_valid} =
             patch_metadata(grid_thw_t, total_patches, spec.spatial_merge_size)
 
-          block_diagonal_attention_mask(image_id_per_patch)
+          block_diagonal_attention_mask(image_id_per_patch, patch_valid)
         end,
         [embeddings, grid_thw],
         op_name: :attention_mask
@@ -418,11 +436,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   end
 
   # Returns {total_patches, total_patches} boolean tensor where True means
-  # the two patches share an image (and are therefore allowed to attend).
-  defnp block_diagonal_attention_mask(image_id_per_patch) do
+  # the two patches share an image AND both are valid (not padding).
+  defnp block_diagonal_attention_mask(image_id_per_patch, patch_valid) do
     a = Nx.new_axis(image_id_per_patch, -1)
     b = Nx.new_axis(image_id_per_patch, 0)
-    Nx.equal(a, b)
+    same_image = Nx.equal(a, b)
+    valid_pair = Nx.multiply(Nx.new_axis(patch_valid, -1), Nx.new_axis(patch_valid, 0))
+    Nx.logical_and(same_image, valid_pair)
   end
 
   defp vision_transformer_blocks(

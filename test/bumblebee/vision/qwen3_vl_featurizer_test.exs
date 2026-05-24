@@ -129,4 +129,40 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizerTest do
       Bumblebee.apply_featurizer(featurizer(min_pixels: 10_000, max_pixels: 1_000), image)
     end
   end
+
+  test "pads pixel_values to :max_patches with zeros" do
+    image = synthetic_image(64, 64)
+    inputs = Bumblebee.apply_featurizer(featurizer(max_patches: 64), image)
+
+    assert {64, 1536} = Nx.shape(inputs["pixel_values"])
+    # First 16 patches are real, rest are zero-padded
+    real_block = inputs["pixel_values"][[0..15, ..]]
+    pad_block = inputs["pixel_values"][[16..63, ..]]
+    assert Nx.to_number(Nx.sum(Nx.abs(pad_block))) == 0.0
+    refute Nx.to_number(Nx.sum(Nx.abs(real_block))) == 0.0
+  end
+
+  test "pads image_grid_thw with [0, 0, 0] rows" do
+    image = synthetic_image(64, 64)
+    inputs = Bumblebee.apply_featurizer(featurizer(max_num_images: 3), image)
+
+    assert {3, 3} = Nx.shape(inputs["image_grid_thw"])
+    assert Nx.to_flat_list(inputs["image_grid_thw"]) == [1, 4, 4, 0, 0, 0, 0, 0, 0]
+  end
+
+  test "raises when :max_patches is not a multiple of merge_size**2" do
+    image = synthetic_image(64, 64)
+
+    assert_raise ArgumentError, ~r/multiple of merge_size/, fn ->
+      Bumblebee.apply_featurizer(featurizer(max_patches: 17), image)
+    end
+  end
+
+  test "raises when image needs more patches than :max_patches" do
+    image = synthetic_image(96, 96)
+
+    assert_raise ArgumentError, ~r/raise :max_patches/, fn ->
+      Bumblebee.apply_featurizer(featurizer(max_patches: 16), image)
+    end
+  end
 end

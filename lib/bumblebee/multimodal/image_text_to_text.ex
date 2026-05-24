@@ -1,13 +1,19 @@
 defmodule Bumblebee.Multimodal.ImageTextToText do
   @moduledoc """
-  Generation helper for vision-language models like Qwen3-VL.
+  Generation helpers for vision-language models like Qwen3-VL.
 
-  This wraps featurization, prompt expansion, and `Bumblebee.Text.Generation`
-  in a single call. Each call recompiles the generation graph if the
-  image or prompt produces a different total patch count or sequence
-  length, which makes this best suited for interactive or one-shot use.
-  For high-throughput serving with batched, varying image sizes, see
-  the static-shape padding follow-up.
+  Two entry points:
+
+    * `generate/6` — one-shot call. Featurizes, expands the prompt
+      placeholder, and runs generation. Each call recompiles the graph
+      when the image or sequence length changes, so it suits
+      interactive use.
+
+    * `compile/5` + `run/3` — compile the generation graph **once** for
+      upper-bound shapes, then run repeatedly with images of varying
+      sizes. The featurizer pads `pixel_values` and `image_grid_thw` to
+      the configured maxima, and the vision encoder excludes padded
+      patches from attention via `patch_valid`.
   """
 
   alias Bumblebee.Text
@@ -95,6 +101,123 @@ defmodule Bumblebee.Multimodal.ImageTextToText do
       |> hd()
 
     %{text: decoded, token_ids: token_ids}
+  end
+
+  @doc """
+  Compiles the generation graph once for the given upper-bound shapes.
+
+  The returned struct can be passed to `run/3` repeatedly. Calls with
+  images that produce fewer than `:max_patches` real patches or
+  shorter than `:sequence_length` prompts are padded; the vision
+  encoder masks the padded positions out of attention.
+
+  ## Options
+
+    * `:max_patches` (required) — upper bound on total patches across
+      all images in one call. Must be a multiple of `merge_size ** 2`.
+    * `:max_num_images` (required) — upper bound on number of images
+      per call.
+    * `:sequence_length` (required) — upper bound on token count
+      (prompt + generated).
+  """
+  def compile(
+        model_info,
+        featurizer,
+        tokenizer,
+        %Text.GenerationConfig{} = generation_config,
+        opts
+      ) do
+    opts = Keyword.validate!(opts, [:max_patches, :max_num_images, :sequence_length])
+    max_patches = Keyword.fetch!(opts, :max_patches)
+    max_num_images = Keyword.fetch!(opts, :max_num_images)
+    sequence_length = Keyword.fetch!(opts, :sequence_length)
+
+    %{model: model, params: params, spec: spec} = model_info
+
+    unless Map.has_key?(spec, :image_token_id) do
+      raise ArgumentError,
+            "expected a multimodal model with :image_token_id, got #{inspect(spec.__struct__)}"
+    end
+
+    merge_size = spec.vision_spec.spatial_merge_size
+
+    featurizer =
+      Bumblebee.configure(featurizer,
+        max_patches: max_patches,
+        max_num_images: max_num_images
+      )
+
+    tokenizer =
+      Bumblebee.configure(tokenizer,
+        length: sequence_length,
+        pad_direction: :left,
+        return_token_type_ids: false
+      )
+
+    generate_fun = Text.Generation.build_generate(model, spec, generation_config)
+
+    %{
+      generate_fun: generate_fun,
+      params: params,
+      spec: spec,
+      featurizer: featurizer,
+      tokenizer: tokenizer,
+      merge_size: merge_size,
+      max_patches: max_patches,
+      max_num_images: max_num_images,
+      sequence_length: sequence_length
+    }
+  end
+
+  @doc """
+  Runs a prompt + image through a pre-compiled generator from `compile/5`.
+
+  EXLA caches the compiled graph by input shape; since the featurizer
+  pads to the upper bounds configured in `compile/5`, every call hits
+  the same cached graph.
+  """
+  def run(compiled, text, image) do
+    %{
+      generate_fun: generate_fun,
+      params: params,
+      featurizer: featurizer,
+      tokenizer: tokenizer,
+      merge_size: merge_size
+    } = compiled
+
+    image_inputs = Bumblebee.apply_featurizer(featurizer, image)
+    grid_thw_real = unpad_grid_thw(image_inputs["image_grid_thw"])
+    visual_tokens = visual_tokens_for(grid_thw_real, merge_size)
+    expanded_text = expand_marker(text, visual_tokens)
+
+    text_inputs = Bumblebee.apply_tokenizer(tokenizer, expanded_text)
+
+    inputs =
+      text_inputs
+      |> Map.merge(image_inputs)
+      |> Map.put("seed", Nx.tensor([:erlang.system_time()], type: :s64))
+
+    %{token_ids: token_ids} = generate_fun.(params, inputs)
+
+    decoded =
+      token_ids
+      |> Nx.to_batched(1)
+      |> Enum.map(&Bumblebee.Tokenizer.decode(tokenizer, Nx.to_flat_list(&1)))
+      |> hd()
+
+    %{text: decoded, token_ids: token_ids}
+  end
+
+  # Drops padding rows ([0, 0, 0]) so visual_tokens_for matches the
+  # actual prompt expansion length.
+  defp unpad_grid_thw(grid_thw) do
+    grid_thw
+    |> Nx.to_list()
+    |> Enum.reject(fn [t, h, w] -> t == 0 and h == 0 and w == 0 end)
+    |> case do
+      [] -> Nx.tensor([[0, 0, 0]], type: :s64)
+      rows -> Nx.tensor(rows, type: :s64)
+    end
   end
 
   defp expand_marker(text, visual_tokens) do

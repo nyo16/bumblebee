@@ -57,6 +57,21 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
       explicit maximum total pixels after smart-resize. Overrides the `:quality`
       preset when set.
       """
+    ],
+    max_patches: [
+      default: nil,
+      doc: """
+      when set, pads `pixel_values` along the patches axis to this size with
+      zeros. Required for compile-once-and-pad serving of variable-size
+      images. Must be a multiple of `merge_size ** 2`.
+      """
+    ],
+    max_num_images: [
+      default: nil,
+      doc: """
+      when set, pads `image_grid_thw` to this many rows with `[0, 0, 0]`.
+      Required alongside `:max_patches` for compile-once-and-pad serving.
+      """
     ]
   ]
 
@@ -117,10 +132,69 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
       |> Enum.map(& &1.grid_thw)
       |> Nx.stack()
 
+    {pixel_values, image_grid_thw} =
+      maybe_pad_to_max(pixel_values, image_grid_thw, featurizer)
+
     %{
       "pixel_values" => pixel_values,
       "image_grid_thw" => image_grid_thw
     }
+  end
+
+  defp maybe_pad_to_max(pixel_values, image_grid_thw, featurizer) do
+    pixel_values = maybe_pad_patches(pixel_values, featurizer)
+    image_grid_thw = maybe_pad_grid_thw(image_grid_thw, featurizer)
+    {pixel_values, image_grid_thw}
+  end
+
+  defp maybe_pad_patches(pixel_values, %{max_patches: nil}), do: pixel_values
+
+  defp maybe_pad_patches(pixel_values, featurizer) do
+    {num_patches, flat} = Nx.shape(pixel_values)
+    max_patches = featurizer.max_patches
+    merge_sq = featurizer.merge_size * featurizer.merge_size
+
+    unless rem(max_patches, merge_sq) == 0 do
+      raise ArgumentError,
+            ":max_patches (#{max_patches}) must be a multiple of merge_size**2 " <>
+              "(= #{merge_sq})"
+    end
+
+    if num_patches > max_patches do
+      raise ArgumentError,
+            "featurizer produced #{num_patches} patches but :max_patches is " <>
+              "#{max_patches}; raise :max_patches or lower :quality / :max_pixels"
+    end
+
+    pad_rows = max_patches - num_patches
+
+    if pad_rows == 0 do
+      pixel_values
+    else
+      padding = Nx.broadcast(Nx.tensor(0.0, type: Nx.type(pixel_values)), {pad_rows, flat})
+      Nx.concatenate([pixel_values, padding], axis: 0)
+    end
+  end
+
+  defp maybe_pad_grid_thw(image_grid_thw, %{max_num_images: nil}), do: image_grid_thw
+
+  defp maybe_pad_grid_thw(image_grid_thw, featurizer) do
+    {num_images, 3} = Nx.shape(image_grid_thw)
+    max_num_images = featurizer.max_num_images
+
+    if num_images > max_num_images do
+      raise ArgumentError,
+            "got #{num_images} images but :max_num_images is #{max_num_images}"
+    end
+
+    pad_rows = max_num_images - num_images
+
+    if pad_rows == 0 do
+      image_grid_thw
+    else
+      padding = Nx.broadcast(Nx.tensor(0, type: Nx.type(image_grid_thw)), {pad_rows, 3})
+      Nx.concatenate([image_grid_thw, padding], axis: 0)
+    end
   end
 
   defp normalize_input(input) when is_list(input), do: input
