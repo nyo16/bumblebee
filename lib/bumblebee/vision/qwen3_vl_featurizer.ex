@@ -4,14 +4,7 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
   options = [
     resize: [
       default: true,
-      doc: "whether to resize the input to the given `:size`"
-    ],
-    size: [
-      default: %{height: 448, width: 448},
-      doc: """
-      the size to resize the input to, given as `%{height: ..., width: ...}`. Only has
-      an effect if `:resize` is `true`
-      """
+      doc: "whether to resize images via the smart-resize algorithm"
     ],
     resize_method: [
       default: :bicubic,
@@ -42,11 +35,50 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
     merge_size: [
       default: 2,
       doc: "the merge factor for spatial patches"
+    ],
+    quality: [
+      default: :medium,
+      doc: """
+      preset controlling the `:min_pixels` / `:max_pixels` caps used by smart-resize.
+      One of `:low` (~256 visual tokens), `:medium` (~1280), or `:high` (16384).
+      Ignored if `:min_pixels` and `:max_pixels` are both set explicitly.
+      """
+    ],
+    min_pixels: [
+      default: nil,
+      doc: """
+      explicit minimum total pixels after smart-resize. Overrides the `:quality`
+      preset when set.
+      """
+    ],
+    max_pixels: [
+      default: nil,
+      doc: """
+      explicit maximum total pixels after smart-resize. Overrides the `:quality`
+      preset when set.
+      """
     ]
   ]
 
   @moduledoc """
   Qwen3-VL featurizer for image and video data.
+
+  Accepts a single image, a list of images, or a `%{video: [frame, ...]}`
+  map. When given multiple images they are concatenated into a single
+  flat sequence of patches; per-image grid dimensions are returned as
+  `image_grid_thw`.
+
+  ## Quality profiles
+
+  Smart-resize caps the total number of pixels passed through the
+  patchifier. The `:quality` preset is a convenience over the explicit
+  `:min_pixels` / `:max_pixels` keys:
+
+    * `:low` — ~256 visual tokens per image (fastest, lowest detail)
+    * `:medium` — ~1280 visual tokens per image (default)
+    * `:high` — up to 16384 visual tokens per image (full Qwen ceiling)
+
+  Set `:min_pixels` and/or `:max_pixels` to override the preset.
 
   ## Configuration
 
@@ -67,12 +99,28 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
 
   @impl true
   def process_input(featurizer, input) do
-    images = normalize_input(input)
+    factor = featurizer.patch_size * featurizer.merge_size
+    {min_pixels, max_pixels} = resolve_pixel_bounds(featurizer, factor)
 
-    for image_or_video <- images do
-      process_single_input(featurizer, image_or_video)
-    end
-    |> Nx.concatenate()
+    per_image =
+      for image_or_video <- normalize_input(input) do
+        process_one(featurizer, image_or_video, min_pixels, max_pixels, factor)
+      end
+
+    pixel_values =
+      per_image
+      |> Enum.map(& &1.pixel_values)
+      |> Nx.concatenate(axis: 0)
+
+    image_grid_thw =
+      per_image
+      |> Enum.map(& &1.grid_thw)
+      |> Nx.stack()
+
+    %{
+      "pixel_values" => pixel_values,
+      "image_grid_thw" => image_grid_thw
+    }
   end
 
   defp normalize_input(input) when is_list(input), do: input
@@ -80,141 +128,198 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
   defp normalize_input(%{video: _} = input), do: [input]
   defp normalize_input(input), do: [%{image: input}]
 
-  defp process_single_input(featurizer, %{video: frames}) when is_list(frames) do
-    # Video input: process multiple frames
-    frames
-    |> Enum.map(&process_frame(featurizer, &1))
-    |> Nx.stack()
-    # Stack frames along temporal dimension: {batch, temporal, height, width, channels}
-    |> Nx.transpose(axes: [1, 0, 2, 3, 4])
+  defp process_one(featurizer, %{video: frames}, min_pixels, max_pixels, factor)
+       when is_list(frames) do
+    process_frames(featurizer, frames, min_pixels, max_pixels, factor)
   end
 
-  defp process_single_input(featurizer, %{image: image}) do
-    # Single image: temporal dimension = 1
-    image
-    |> process_frame(featurizer)
-    |> Nx.new_axis(1)
-
-    # Shape: {batch, 1, height, width, channels}
+  defp process_one(featurizer, %{image: image}, min_pixels, max_pixels, factor) do
+    process_frames(featurizer, [image], min_pixels, max_pixels, factor)
   end
 
-  defp process_single_input(featurizer, image) do
-    # Assume it's just an image
-    process_single_input(featurizer, %{image: image})
+  defp process_one(featurizer, image, min_pixels, max_pixels, factor) do
+    process_frames(featurizer, [image], min_pixels, max_pixels, factor)
   end
 
-  defp process_frame(frame, featurizer) do
-    frame =
-      frame
-      |> Image.to_batched_tensor()
-      |> Nx.as_type(:f32)
-      |> Image.normalize_channels(length(featurizer.image_mean))
+  defp process_frames(featurizer, frames, min_pixels, max_pixels, factor) do
+    num_channels = length(featurizer.image_mean)
 
-    # Qwen3VL requires image dimensions to be divisible by patch_size * merge_size
-    factor = featurizer.patch_size * featurizer.merge_size
+    batched_frames =
+      Enum.map(frames, fn frame ->
+        frame
+        |> Image.to_batched_tensor()
+        |> Nx.as_type(:f32)
+        |> Image.normalize_channels(num_channels)
+      end)
 
-    {_, h, w, _} = Nx.shape(frame)
+    [first | _] = batched_frames
+    {1, height, width, _} = Nx.shape(first)
 
-    # Compute target size - round to nearest multiple of factor
-    target_h = round_to_multiple(h, factor)
-    target_w = round_to_multiple(w, factor)
+    {target_h, target_w} =
+      if featurizer.resize do
+        smart_resize(height, width, min_pixels, max_pixels, factor)
+      else
+        h = max(factor, round_to_multiple(height, factor))
+        w = max(factor, round_to_multiple(width, factor))
+        {h, w}
+      end
 
-    # Ensure minimum size
-    target_h = max(target_h, factor)
-    target_w = max(target_w, factor)
+    mean = Nx.tensor(featurizer.image_mean)
+    std = Nx.tensor(featurizer.image_std)
 
-    NxImage.resize(frame, {target_h, target_w}, method: featurizer.resize_method)
+    processed_frames =
+      Enum.map(batched_frames, fn frame ->
+        frame
+        |> NxImage.resize({target_h, target_w}, method: featurizer.resize_method)
+        |> NxImage.to_continuous(0, 1)
+        |> maybe_normalize(featurizer, mean, std)
+        |> Nx.squeeze(axes: [0])
+      end)
+
+    stacked = Nx.stack(processed_frames)
+    {stacked, temporal} = ensure_temporal(stacked, featurizer.temporal_patch_size)
+
+    patches_t = div(temporal, featurizer.temporal_patch_size)
+    patches_h = div(target_h, featurizer.patch_size)
+    patches_w = div(target_w, featurizer.patch_size)
+
+    pixel_values = window_patchify(stacked, featurizer, patches_t, patches_h, patches_w)
+
+    %{
+      pixel_values: pixel_values,
+      grid_thw: Nx.tensor([patches_t, patches_h, patches_w], type: :s64)
+    }
+  end
+
+  defp maybe_normalize(images, %{normalize: false}, _mean, _std), do: images
+  defp maybe_normalize(images, _, mean, std), do: NxImage.normalize(images, mean, std)
+
+  defp ensure_temporal(stacked, temporal_patch_size) do
+    {temporal, _, _, _} = Nx.shape(stacked)
+
+    target =
+      if temporal < temporal_patch_size do
+        temporal_patch_size
+      else
+        div(temporal, temporal_patch_size) * temporal_patch_size
+      end
+
+    cond do
+      target == temporal ->
+        {stacked, temporal}
+
+      target > temporal ->
+        last = stacked[(temporal - 1)..(temporal - 1)//1]
+        pad = Nx.tile(last, [target - temporal, 1, 1, 1])
+        {Nx.concatenate([stacked, pad], axis: 0), target}
+
+      target < temporal ->
+        {Nx.slice_along_axis(stacked, 0, target, axis: 0), target}
+    end
+  end
+
+  # Arranges patches in "windowed" order so that every group of
+  # merge_size * merge_size consecutive patches forms a contiguous
+  # spatial merge block. This lets the vision encoder's patch merger
+  # reshape {N, hidden} -> {N/merge^2, merge^2 * hidden} without
+  # needing to know per-image grid dimensions.
+  defp window_patchify(stacked, featurizer, patches_t, patches_h, patches_w) do
+    {_temporal, _height, _width, channels} = Nx.shape(stacked)
+    patch_size = featurizer.patch_size
+    temporal_patch_size = featurizer.temporal_patch_size
+    merge_size = featurizer.merge_size
+    merged_h = div(patches_h, merge_size)
+    merged_w = div(patches_w, merge_size)
+
+    stacked
+    |> Nx.reshape({
+      patches_t,
+      temporal_patch_size,
+      merged_h,
+      merge_size,
+      patch_size,
+      merged_w,
+      merge_size,
+      patch_size,
+      channels
+    })
+    |> Nx.transpose(axes: [0, 2, 5, 3, 6, 8, 1, 4, 7])
+    |> Nx.reshape({
+      patches_t * merged_h * merged_w * merge_size * merge_size,
+      channels * temporal_patch_size * patch_size * patch_size
+    })
+  end
+
+  defp smart_resize(height, width, min_pixels, max_pixels, factor) do
+    ratio = max(height, width) / min(height, width)
+
+    if ratio > 200 do
+      raise ArgumentError,
+            "image aspect ratio is #{Float.round(ratio, 2)}, " <>
+              "which exceeds the supported limit of 200"
+    end
+
+    h_bar = max(factor, round_to_multiple(height, factor))
+    w_bar = max(factor, round_to_multiple(width, factor))
+
+    cond do
+      h_bar * w_bar > max_pixels ->
+        beta = :math.sqrt(height * width / max_pixels)
+        h2 = floor_to_multiple(height / beta, factor)
+        w2 = floor_to_multiple(width / beta, factor)
+        {max(factor, h2), max(factor, w2)}
+
+      h_bar * w_bar < min_pixels ->
+        beta = :math.sqrt(min_pixels / (height * width))
+        h2 = ceil_to_multiple(height * beta, factor)
+        w2 = ceil_to_multiple(width * beta, factor)
+        {h2, w2}
+
+      true ->
+        {h_bar, w_bar}
+    end
   end
 
   defp round_to_multiple(value, factor) do
-    div(value + div(factor, 2), factor) * factor
+    round(value / factor) * factor
   end
 
-  @impl true
-  def batch_template(featurizer, batch_size) do
-    # Get height/width from size config, defaulting to 224 if not specified
-    {height, width} =
-      case featurizer.size do
-        %{height: h, width: w} -> {h, w}
-        %{shortest_edge: edge} when edge < 10000 -> {edge, edge}
-        _ -> {224, 224}
-      end
-
-    num_channels = length(featurizer.image_mean)
-    # Output shape includes temporal dimension: {batch, channels, temporal, height, width}
-    # For template, we use temporal=1 (single image case)
-    %{
-      "pixel_values" => Nx.template({batch_size, num_channels, 1, height, width}, :f32)
-    }
+  defp floor_to_multiple(value, factor) do
+    trunc(value / factor) * factor
   end
 
-  @impl true
-  def process_batch(featurizer, images) do
-    # images shape: {batch, temporal, height, width, channels}
-    images = NxImage.to_continuous(images, 0, 1)
+  defp ceil_to_multiple(value, factor) do
+    trunc(Float.ceil(value / factor)) * factor
+  end
 
-    images =
-      if featurizer.normalize do
-        NxImage.normalize(
-          images,
-          Nx.tensor(featurizer.image_mean),
-          Nx.tensor(featurizer.image_std)
-        )
-      else
-        images
+  defp resolve_pixel_bounds(featurizer, factor) do
+    f2 = factor * factor
+
+    {default_min, default_max} =
+      case featurizer.quality do
+        :low ->
+          {4 * f2, 256 * f2}
+
+        :medium ->
+          {4 * f2, 1280 * f2}
+
+        :high ->
+          {4 * f2, 16384 * f2}
+
+        other ->
+          raise ArgumentError,
+                "invalid :quality #{inspect(other)}, expected :low, :medium, or :high"
       end
 
-    # Extract patches like Python processor
-    # Python format: {num_patches, channels * temporal * patch_h * patch_w}
-    {batch, temporal, height, width, channels} = Nx.shape(images)
+    min_pixels = featurizer.min_pixels || default_min
+    max_pixels = featurizer.max_pixels || default_max
 
-    patch_size = featurizer.patch_size
-    temporal_patch_size = featurizer.temporal_patch_size
+    if min_pixels > max_pixels do
+      raise ArgumentError,
+            "min_pixels (#{min_pixels}) must not exceed max_pixels (#{max_pixels})"
+    end
 
-    # For single images (temporal=1), Python duplicates the frame to match temporal_patch_size
-    {images, temporal} =
-      if temporal < temporal_patch_size do
-        # Repeat the frame to match temporal_patch_size
-        repeated = Nx.tile(images, [1, temporal_patch_size, 1, 1, 1])
-        {repeated, temporal_patch_size}
-      else
-        {images, temporal}
-      end
-
-    patches_h = div(height, patch_size)
-    patches_w = div(width, patch_size)
-    patches_t = div(temporal, temporal_patch_size)
-
-    # Reshape to extract patches
-    # {batch, temporal, height, width, channels}
-    # -> {batch, patches_t, temporal_patch_size, patches_h, patch_size, patches_w, patch_size, channels}
-    images =
-      images
-      |> Nx.reshape(
-        {batch, patches_t, temporal_patch_size, patches_h, patch_size, patches_w, patch_size,
-         channels}
-      )
-      # Reorder for Python format: patches, then [channels, temporal, h, w]
-      # -> {batch, patches_t, patches_h, patches_w, channels, temporal_patch_size, patch_size, patch_size}
-      |> Nx.transpose(axes: [0, 1, 3, 5, 7, 2, 4, 6])
-      # Flatten patches: {batch, num_patches, channels * temporal * patch_h * patch_w}
-      |> Nx.reshape(
-        {batch, patches_t * patches_h * patches_w,
-         channels * temporal_patch_size * patch_size * patch_size}
-      )
-
-    # For a single batch item, flatten to {num_patches, flattened_patch_size}
-    # This matches Python's format
-    {_batch, num_patches, patch_values} = Nx.shape(images)
-    pixel_values = Nx.reshape(images, {num_patches, patch_values})
-
-    # Generate grid_thw (temporal, height_patches, width_patches) per image
-    image_grid_thw = Nx.tensor([[patches_t, patches_h, patches_w]])
-
-    %{
-      "pixel_values" => pixel_values,
-      "image_grid_thw" => image_grid_thw
-    }
+    {min_pixels, max_pixels}
   end
 
   defimpl Bumblebee.HuggingFace.Transformers.Config do
@@ -224,14 +329,15 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
       opts =
         convert!(data,
           resize: {"do_resize", boolean()},
-          size: {"size", image_size()},
           resize_method: {"resample", resize_method()},
           normalize: {"do_normalize", boolean()},
           image_mean: {"image_mean", list(number())},
           image_std: {"image_std", list(number())},
           patch_size: {"patch_size", number()},
           temporal_patch_size: {"temporal_patch_size", number()},
-          merge_size: {"merge_size", number()}
+          merge_size: {"merge_size", number()},
+          min_pixels: {"min_pixels", number()},
+          max_pixels: {"max_pixels", number()}
         )
 
       @for.config(featurizer, opts)

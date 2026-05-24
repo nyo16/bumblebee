@@ -33,9 +33,15 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
 
     * `"pixel_values"` - `{num_patches, flattened_patch_size}`
 
-      Pre-extracted image/video patches from the featurizer. The shape is
-      `{num_patches, channels * temporal_patch_size * patch_size * patch_size}`.
-      For a 384x384 image with default settings, this is `{576, 1536}`.
+      Concatenated, pre-extracted image/video patches from the featurizer.
+      Shape is `{num_patches, channels * temporal_patch_size * patch_size * patch_size}`.
+
+    * `"image_grid_thw"` - `{num_images, 3}`
+
+      Per-image grid dimensions `[temporal, height, width]` in patch
+      units. Threaded into the vision encoder so it can compute correct
+      per-patch positions for variable image sizes and multiple images
+      per prompt.
 
     * `"input_ids"` - `{batch_size, sequence_length}`
 
@@ -92,6 +98,7 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
 
     %{
       "pixel_values" => Nx.template({num_patches, flattened_patch_size}, :f32),
+      "image_grid_thw" => Nx.template({1, 3}, :s64),
       "input_ids" => Nx.template({1, 1}, :u32)
     }
   end
@@ -114,7 +121,8 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
       Bumblebee.build_model(spec.vision_spec)
       |> Bumblebee.Utils.Axon.prefix_names("vision_model.")
       |> Bumblebee.Utils.Axon.plug_inputs(%{
-        "pixel_values" => inputs["pixel_values"]
+        "pixel_values" => inputs["pixel_values"],
+        "image_grid_thw" => inputs["image_grid_thw"]
       })
 
     # Get vision embeddings using correct Axon.nx pattern
@@ -194,6 +202,7 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
 
     Bumblebee.Utils.Model.inputs_to_map([
       Axon.input("pixel_values", optional: true, shape: vision_shape),
+      Axon.input("image_grid_thw", optional: true, shape: {nil, 3}),
       Axon.input("input_ids", shape: text_shape),
       Axon.input("attention_mask", optional: true, shape: text_shape),
       Axon.input("position_ids", optional: true, shape: text_shape),

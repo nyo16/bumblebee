@@ -47,4 +47,91 @@ defmodule Bumblebee.Multimodal.Qwen3VLTest do
       atol: 1.0e-4
     )
   end
+
+  test "vision pathway runs end-to-end with image_grid_thw" do
+    assert {:ok, %{model: model, params: params, spec: spec}} =
+             Bumblebee.load_model({:hf, "roulis/tiny-random-Qwen3VLForConditionalGeneration"})
+
+    factor = spec.vision_spec.patch_size * spec.vision_spec.spatial_merge_size
+
+    featurizer =
+      Bumblebee.configure(Bumblebee.Vision.Qwen3VLFeaturizer,
+        patch_size: spec.vision_spec.patch_size,
+        merge_size: spec.vision_spec.spatial_merge_size,
+        temporal_patch_size: spec.vision_spec.temporal_patch_size,
+        min_pixels: 4 * factor * factor,
+        max_pixels: 64 * factor * factor
+      )
+
+    image = Nx.iota({64, 64, 3}, type: :u8)
+    image_inputs = Bumblebee.apply_featurizer(featurizer, image)
+
+    [grid_t, grid_h, grid_w] = Nx.to_flat_list(image_inputs["image_grid_thw"])
+    merge_size = spec.vision_spec.spatial_merge_size
+    visual_tokens = grid_t * div(grid_h, merge_size) * div(grid_w, merge_size)
+
+    image_token_id = spec.image_token_id
+    input_ids = List.duplicate(image_token_id, visual_tokens) ++ [1, 2, 3]
+    attention_mask = List.duplicate(1, length(input_ids))
+
+    inputs = %{
+      "input_ids" => Nx.tensor([input_ids]),
+      "attention_mask" => Nx.tensor([attention_mask]),
+      "pixel_values" => image_inputs["pixel_values"],
+      "image_grid_thw" => image_inputs["image_grid_thw"]
+    }
+
+    outputs = Axon.predict(model, params, inputs)
+
+    expected_seq = visual_tokens + 3
+    assert {1, ^expected_seq, 1024} = Nx.shape(outputs.logits)
+  end
+
+  test "vision pathway accepts multiple images of different sizes" do
+    assert {:ok, %{model: model, params: params, spec: spec}} =
+             Bumblebee.load_model({:hf, "roulis/tiny-random-Qwen3VLForConditionalGeneration"})
+
+    factor = spec.vision_spec.patch_size * spec.vision_spec.spatial_merge_size
+
+    featurizer =
+      Bumblebee.configure(Bumblebee.Vision.Qwen3VLFeaturizer,
+        patch_size: spec.vision_spec.patch_size,
+        merge_size: spec.vision_spec.spatial_merge_size,
+        temporal_patch_size: spec.vision_spec.temporal_patch_size,
+        min_pixels: 4 * factor * factor,
+        max_pixels: 64 * factor * factor
+      )
+
+    images = [Nx.iota({56, 56, 3}, type: :u8), Nx.iota({84, 56, 3}, type: :u8)]
+    image_inputs = Bumblebee.apply_featurizer(featurizer, images)
+
+    assert {2, 3} = Nx.shape(image_inputs["image_grid_thw"])
+
+    merge_size = spec.vision_spec.spatial_merge_size
+
+    visual_tokens =
+      image_inputs["image_grid_thw"]
+      |> Nx.to_batched(1)
+      |> Enum.map(fn row ->
+        [t, h, w] = Nx.to_flat_list(row)
+        t * div(h, merge_size) * div(w, merge_size)
+      end)
+      |> Enum.sum()
+
+    image_token_id = spec.image_token_id
+    input_ids = List.duplicate(image_token_id, visual_tokens) ++ [1, 2]
+    attention_mask = List.duplicate(1, length(input_ids))
+
+    inputs = %{
+      "input_ids" => Nx.tensor([input_ids]),
+      "attention_mask" => Nx.tensor([attention_mask]),
+      "pixel_values" => image_inputs["pixel_values"],
+      "image_grid_thw" => image_inputs["image_grid_thw"]
+    }
+
+    outputs = Axon.predict(model, params, inputs)
+
+    expected_seq = visual_tokens + 2
+    assert {1, ^expected_seq, 1024} = Nx.shape(outputs.logits)
+  end
 end
